@@ -6,6 +6,7 @@
 // ============================================================================
 #include "../cuda_encode_common.cuh"
 #include "../moe_heat_rank.hpp"
+#include "flashnext_common.hpp"
 
 static std::map<int, std::vector<int>> load_heat_ranks(const std::string& trace_path, int n_exp) {
     std::map<int, std::vector<int>> counts;
@@ -69,7 +70,7 @@ int main(int argc, char** argv) {
     std::string model_dir = "", out_dir = "", trace_path = "", tables_path = "";
     std::string mode = "moe", tag = "heat";
     int l_start = 0, l_end = 47, n5 = 0, n4 = 192, ple_bits = 3;
-    bool do_mtp = false, skip_existing = false;
+    bool layers_given = false, do_mtp = false, skip_existing = false;
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -79,7 +80,7 @@ int main(int argc, char** argv) {
         else if (a == "--trace" && i + 1 < argc) trace_path = argv[++i];
         else if (a == "--mode" && i + 1 < argc) mode = argv[++i];
         else if (a == "--tables" && i + 1 < argc) tables_path = argv[++i];
-        else if (a == "--layers" && i + 2 < argc) { l_start = atoi(argv[++i]); l_end = atoi(argv[++i]); }
+        else if (a == "--layers" && i + 2 < argc) { l_start = atoi(argv[++i]); l_end = atoi(argv[++i]); layers_given = true; }
         else if (a == "--n5" && i + 1 < argc) n5 = atoi(argv[++i]);
         else if (a == "--n4" && i + 1 < argc) n4 = atoi(argv[++i]);
         else if (a == "--ple-bits" && i + 1 < argc) ple_bits = atoi(argv[++i]);
@@ -117,24 +118,32 @@ int main(int argc, char** argv) {
             storage.reserve(48);
             for (int k = 0; k < 16; ++k) {
                 int sh = grp * 16 + k;
-                char stem[160];
-                snprintf(stem, sizeof(stem), "language_model.model.embed_tokens_per_layer.shards.%d", sh);
-                TFQ_CUDA_CHECK(cudaMemcpy(d_sw, cache.get_tensor(std::string(stem) + ".weight"), src_w_bytes, cudaMemcpyHostToDevice));
-                TFQ_CUDA_CHECK(cudaMemcpy(d_ss, cache.get_tensor(std::string(stem) + ".scales"), sb_bytes, cudaMemcpyHostToDevice));
-                TFQ_CUDA_CHECK(cudaMemcpy(d_sb, cache.get_tensor(std::string(stem) + ".biases"), sb_bytes, cudaMemcpyHostToDevice));
+                std::string stem = tfq_flashnext::canonical_ple_stem(sh);
+                std::string src_stem = tfq_flashnext::resolve_ple_src_stem(cache, sh);
+                size_t lw = 0, ls = 0, lb = 0;
+                const uint8_t* pw = cache.get_tensor(src_stem + ".weight", nullptr, &lw);
+                const uint8_t* ps = cache.get_tensor(src_stem + ".scales", nullptr, &ls);
+                const uint8_t* pb = cache.get_tensor(src_stem + ".biases", nullptr, &lb);
+                if (lw != src_w_bytes || ls != sb_bytes || lb != sb_bytes) {
+                    fprintf(stderr, "Unexpected PLE shard_%d sizes: %zu %zu %zu\n", sh, lw, ls, lb);
+                    return 2;
+                }
+                TFQ_CUDA_CHECK(cudaMemcpy(d_sw, pw, src_w_bytes, cudaMemcpyHostToDevice));
+                TFQ_CUDA_CHECK(cudaMemcpy(d_ss, ps, sb_bytes, cudaMemcpyHostToDevice));
+                TFQ_CUDA_CHECK(cudaMemcpy(d_sb, pb, sb_bytes, cudaMemcpyHostToDevice));
                 PleParams pp{ROWS, COLS, (uint32_t)ple_bits, 0u};
                 uint32_t total_g = ROWS * NG;
                 requant_ple_q8_to_qb_kernel<<<(total_g + 255u) / 256u, 256>>>(d_sw, d_ss, d_sb, d_dw, d_ds, d_db, pp);
                 TFQ_CUDA_CHECK(cudaDeviceSynchronize());
                 storage.emplace_back(dst_w_bytes);
                 TFQ_CUDA_CHECK(cudaMemcpy(storage.back().data(), d_dw, dst_w_bytes, cudaMemcpyDeviceToHost));
-                names.push_back(std::string(stem) + ".weight"); dtypes.push_back("U32"); shapes.push_back({ROWS, NG * (size_t)ple_bits});
+                names.push_back(stem + ".weight"); dtypes.push_back("U32"); shapes.push_back({ROWS, NG * (size_t)ple_bits});
                 storage.emplace_back(sb_bytes);
                 TFQ_CUDA_CHECK(cudaMemcpy(storage.back().data(), d_ds, sb_bytes, cudaMemcpyDeviceToHost));
-                names.push_back(std::string(stem) + ".scales"); dtypes.push_back("BF16"); shapes.push_back({ROWS, NG});
+                names.push_back(stem + ".scales"); dtypes.push_back("BF16"); shapes.push_back({ROWS, NG});
                 storage.emplace_back(sb_bytes);
                 TFQ_CUDA_CHECK(cudaMemcpy(storage.back().data(), d_db, sb_bytes, cudaMemcpyDeviceToHost));
-                names.push_back(std::string(stem) + ".biases"); dtypes.push_back("BF16"); shapes.push_back({ROWS, NG});
+                names.push_back(stem + ".biases"); dtypes.push_back("BF16"); shapes.push_back({ROWS, NG});
             }
             std::vector<const void*> ptrs(storage.size());
             std::vector<size_t> lens(storage.size());
@@ -189,9 +198,7 @@ int main(int argc, char** argv) {
     auto heat_ranks = trace_path.empty() ? std::map<int, std::vector<int>>{} : load_heat_ranks(trace_path, N_EXP);
     const char* proj_names[3] = {"gate_proj", "up_proj", "down_proj"};
     const int proj_R[3] = {I, I, H}, proj_C[3] = {H, H, I};
-    std::vector<int> layer_list;
-    if (do_mtp) layer_list.push_back(48);
-    else for (int l = l_start; l <= l_end; ++l) layer_list.push_back(l);
+    std::vector<int> layer_list = tfq_flashnext::build_layer_list(l_start, l_end, layers_given, do_mtp);
 
     printf("CUDA TFQ3 FLASHNEXT MOE CONVERTER | n5=%d n4=%d n3=%d (avg %.3f bpw) | layers=%zu\n",
            n5, n4, N_EXP - n5 - n4, (5.0 * n5 + 4.0 * n4 + 3.0 * (N_EXP - n5 - n4)) / N_EXP, layer_list.size());
@@ -292,7 +299,7 @@ int main(int argc, char** argv) {
         hdr.raw_fp8_bytes = (uint64_t)N_EXP * 3ULL * MAX_ELEMS;
         hdr.stream_words = all_weights.size(); hdr.scale_halfs = all_scales.size();
         hdr.off_meta = off_meta; hdr.off_scales = off_sc; hdr.off_weights = off_w;
-        strncpy((char*)hdr.meta_tag, tag.c_str(), 31);
+        snprintf((char*)hdr.meta_tag, 32, "fn_v3_%s", tag.c_str());
         std::vector<uint8_t> zeros(ALIGN_16K, 0);
         std::string tmp = std::string(out_path) + ".tmp";
         FILE* fo = fopen(tmp.c_str(), "wb");

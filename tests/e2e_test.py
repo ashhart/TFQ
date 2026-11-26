@@ -935,6 +935,118 @@ def test_planner_nonfinite(tmp: str) -> None:
     print(f"PASS planner rejects non-finite weights ({len(cases)} dtype/value cases)")
 
 
+def test_flashnext_mlx_vlm_0712(tmp: str) -> None:
+    """Verify FlashNext PR #26 fixes: package.py override preservation + shared Metal/CUDA PLE & --mtp helpers."""
+    cxx = "clang++" if platform.system() == "Darwin" else "g++"
+    src = os.path.join(tmp, "test_flashnext_common.cpp")
+    exe = os.path.join(tmp, "test_flashnext_common")
+    hdr = os.path.join(REPO_ROOT, "src", "converters", "flashnext", "flashnext_common.hpp")
+    with open(src, "w", encoding="utf-8") as f:
+        f.write(
+            f'#include "{hdr}"\n'
+            '#include <cassert>\n'
+            '#include <set>\n'
+            'struct FakeCache {\n'
+            '    std::set<std::string> keys;\n'
+            '    bool has_tensor(const std::string& k) const { return keys.count(k) > 0; }\n'
+            '};\n'
+            'int main() {\n'
+            '    FakeCache c_old, c_new;\n'
+            '    c_old.keys.insert("language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shard_7.weight");\n'
+            '    c_new.keys.insert("language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.7.weight");\n'
+            '    assert(tfq_flashnext::resolve_ple_src_stem(c_old, 7) ==\n'
+            '           "language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shard_7");\n'
+            '    assert(tfq_flashnext::resolve_ple_src_stem(c_new, 7) ==\n'
+            '           "language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.7");\n'
+            '    auto all48 = tfq_flashnext::build_layer_list(0, 47, false, false);\n'
+            '    assert(all48.size() == 48 && all48.front() == 0 && all48.back() == 47);\n'
+            '    auto mtp_only = tfq_flashnext::build_layer_list(0, 47, false, true);\n'
+            '    assert(mtp_only.size() == 1 && mtp_only[0] == 48);\n'
+            '    auto l47_mtp = tfq_flashnext::build_layer_list(47, 47, true, true);\n'
+            '    assert(l47_mtp.size() == 2 && l47_mtp[0] == 47 && l47_mtp[1] == 48);\n'
+            '    auto mid = tfq_flashnext::build_layer_list(6, 46, true, false);\n'
+            '    assert(mid.size() == 41 && mid.front() == 6 && mid.back() == 46);\n'
+            '    return 0;\n'
+            '}\n'
+        )
+    run([cxx, "-O2", "-std=c++17", "-Wall", "-Wextra", "-Werror", src, "-o", exe])
+    run([exe])
+
+    # Test src/converters/flashnext/package.py per-tensor override preservation (mlx-vlm 0.7.12 layout)
+    fn_src = os.path.join(tmp, "fn_src")
+    fn_out = os.path.join(tmp, "fn_out")
+    fn_ple = os.path.join(tmp, "fn_ple")
+    os.makedirs(fn_src, exist_ok=True)
+    os.makedirs(fn_ple, exist_ok=True)
+
+    def write_st(path: str, items: list[tuple[str, str, list[int], bytes]]) -> None:
+        h, pay = {}, bytearray()
+        for nm, dt, sh, raw in items:
+            s = len(pay)
+            pay.extend(raw)
+            h[nm] = {"dtype": dt, "shape": sh, "data_offsets": [s, len(pay)]}
+        hb = json.dumps(h, separators=(",", ":")).encode("utf-8")
+        with open(path, "wb") as fh:
+            fh.write(struct.pack("<Q", len(hb)) + hb + pay)
+
+    src_tensors = [
+        ("language_model.model.layers.0.mlp.gate.weight", "U32", [4, 4], bytes(64)),
+        ("language_model.model.layers.0.mlp.gate.scales", "BF16", [4, 1], bytes(8)),
+        ("language_model.model.layers.0.mlp.gate.biases", "BF16", [4, 1], bytes(8)),
+        ("language_model.model.layers.0.mlp.shared_expert_gate.weight", "U32", [4, 4], bytes(64)),
+        ("language_model.model.layers.0.mlp.shared_expert_gate.scales", "BF16", [4, 1], bytes(8)),
+        ("language_model.model.layers.0.mlp.shared_expert_gate.biases", "BF16", [4, 1], bytes(8)),
+        ("language_model.model.layers.0.mlp.switch_mlp.gate_proj.weight", "U32", [4, 4], bytes(64)),
+        ("language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.0.weight", "U32", [4, 4], bytes(64)),
+    ]
+    write_st(os.path.join(fn_src, "model-00001-of-00001.safetensors"), src_tensors)
+    with open(os.path.join(fn_src, "model.safetensors.index.json"), "w", encoding="utf-8") as fh:
+        json.dump(
+            {"metadata": {"total_size": 0}, "weight_map": {k: "model-00001-of-00001.safetensors" for k, _, _, _ in src_tensors}},
+            fh,
+        )
+    gate_ov = {"group_size": 64, "bits": 8, "mode": "affine"}
+    src_q = {
+        "group_size": 32,
+        "bits": 8,
+        "mode": "affine",
+        "language_model.model.layers.0.mlp.gate": gate_ov,
+        "language_model.model.layers.0.mlp.shared_expert_gate": gate_ov,
+        "language_model.model.layers.0.mlp.switch_mlp.gate_proj": {"group_size": 64, "bits": 8, "mode": "affine"},
+        "language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.0": {"group_size": 32, "bits": 8, "mode": "affine"},
+    }
+    with open(os.path.join(fn_src, "config.json"), "w", encoding="utf-8") as fh:
+        json.dump({"model_type": "qwen4_exp", "quantization": src_q, "text_config": {"quantization": src_q}}, fh)
+
+    for grp in range(8):
+        ple_items = []
+        for s in range(grp * 16, grp * 16 + 16):
+            st_nm = f"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shard_{s}.weight"
+            ple_items.append((st_nm, "U32", [2, 2], bytes(16)))
+        write_st(os.path.join(fn_ple, f"ple_b3_{grp:02d}.safetensors"), ple_items)
+
+    pkg_py = os.path.join(REPO_ROOT, "src", "converters", "flashnext", "package.py")
+    run([sys.executable, pkg_py, "--src", fn_src, "--out", fn_out, "--extract-nonmoe", "--write-index",
+         "--ple-bits", "3", "--ple-dir", fn_ple, "--move-ple"])
+
+    out_cfg = json.load(open(os.path.join(fn_out, "config.json"), "r", encoding="utf-8"))
+    out_q = out_cfg["quantization"]
+    assert out_q["language_model.model.layers.0.mlp.gate"] == gate_ov, out_q
+    assert out_q["language_model.model.layers.0.mlp.shared_expert_gate"] == gate_ov, out_q
+    assert "language_model.model.layers.0.mlp.switch_mlp.gate_proj" not in out_q, out_q
+    assert "language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.0" not in out_q, out_q
+    assert out_q["language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shard_0"] == {
+        "group_size": 32, "bits": 3, "mode": "affine"
+    }
+    assert out_cfg["text_config"]["quantization"] == out_q
+    out_idx = json.load(open(os.path.join(fn_out, "model.safetensors.index.json"), "r", encoding="utf-8"))["weight_map"]
+    assert "language_model.model.layers.0.mlp.gate.weight" in out_idx
+    assert "language_model.model.layers.0.mlp.switch_mlp.gate_proj.weight" not in out_idx
+    assert "language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.0.weight" not in out_idx
+    assert "language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shard_127.weight" in out_idx
+    print("PASS FlashNext mlx-vlm 0.7.12 (PLE shards.N fallback, --layers+--mtp, package.py override preservation)")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--no-gpu", action="store_true", help="Skip GPU converter round-trips (for headless CI runners)")
@@ -953,6 +1065,7 @@ def main() -> None:
         refs = write_synthetic_model(model_dir)
         test_canonical_tables(tmp)
         test_moe_datafree_ranking(tmp)
+        test_flashnext_mlx_vlm_0712(tmp)
         test_planner_shape_whitespace(tmp)
         test_planner_fp8_scales(tmp)
         test_planner_nonfinite(tmp)

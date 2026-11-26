@@ -77,7 +77,7 @@ $(BUILD)/tfq3-qwen27-convert.metallib: src/converters/qwen27/convert.metal src/c
 	$(METALLIB) $(BUILD)/qwen27.air -o $@
 	@rm -f $(BUILD)/qwen27.air
 
-$(BUILD)/tfq3-flashnext-convert: src/converters/flashnext/convert.mm src/converters/moe_heat_rank.hpp $(METAL_ENC_HDRS) | $(BUILD)
+$(BUILD)/tfq3-flashnext-convert: src/converters/flashnext/convert.mm src/converters/flashnext/flashnext_common.hpp src/converters/moe_heat_rank.hpp $(METAL_ENC_HDRS) | $(BUILD)
 	$(OBJCXX) $< -o $@
 
 $(BUILD)/tfq3-flashnext-convert.metallib: src/converters/flashnext/convert.metal src/converters/metal_encode_common.metal | $(BUILD)
@@ -136,7 +136,7 @@ $(BUILD)/tfq4-convert-cuda: src/converters/tfq4/convert.cu src/converters/tfq4/t
 $(BUILD)/tfq3-qwen27-convert-cuda: src/converters/qwen27/convert.cu src/converters/cuda_encode_common.cuh $(METAL_ENC_HDRS) | $(BUILD)
 	$(NVCC) $(NVCC_ENC_FLAGS) $< -o $@
 
-$(BUILD)/tfq3-flashnext-convert-cuda: src/converters/flashnext/convert.cu src/converters/cuda_encode_common.cuh src/converters/moe_heat_rank.hpp $(METAL_ENC_HDRS) | $(BUILD)
+$(BUILD)/tfq3-flashnext-convert-cuda: src/converters/flashnext/convert.cu src/converters/flashnext/flashnext_common.hpp src/converters/cuda_encode_common.cuh src/converters/moe_heat_rank.hpp $(METAL_ENC_HDRS) | $(BUILD)
 	$(NVCC) $(NVCC_ENC_FLAGS) $< -o $@
 
 $(BUILD)/tfq3-glm-convert-cuda: src/converters/glm/convert.cu src/converters/cuda_encode_common.cuh src/converters/moe_heat_rank.hpp $(METAL_ENC_HDRS) | $(BUILD)

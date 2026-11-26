@@ -21,6 +21,7 @@
 #include <vector>
 #include "../moe_heat_rank.hpp"
 #include "../tfq_tables_io.hpp"
+#include "flashnext_common.hpp"
 
 // ============================================================================
 // TensorFold TFQ3 (2D-AffineCoset/half4) FlashNext GPU Converter (Apple M5)
@@ -31,7 +32,6 @@
 // ============================================================================
 
 static constexpr uint32_t MAGIC_TFPW = 0x57504654u; // "TFPW"
-static constexpr uint32_t MAGIC_PWV3 = 0x33565750u; // "PWV3"
 static constexpr uint32_t FORMAT_VER = 3u;
 static constexpr size_t   ALIGN_16K  = 16384;
 
@@ -317,15 +317,8 @@ int main(int argc, char** argv) {
                 std::vector<std::vector<uint8_t>> storage;
                 storage.reserve(16 * 3);
                 for (int s = grp * 16; s < grp * 16 + 16; ++s) {
-                    char stem[192];
-                    snprintf(stem, sizeof(stem), "language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shard_%d", s);
-                    // mlx-vlm >= 0.7.12 names these ngram_embedding.shards.N; older builds use shard_N.
-                    std::string src_stem(stem);
-                    if (cache.weight_map.find(src_stem + ".weight") == cache.weight_map.end()) {
-                        char alt[192];
-                        snprintf(alt, sizeof(alt), "language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.%d", s);
-                        src_stem = alt;
-                    }
+                    std::string stem = tfq_flashnext::canonical_ple_stem(s);
+                    std::string src_stem = tfq_flashnext::resolve_ple_src_stem(cache, s);
                     size_t lw = 0, ls = 0, lb = 0;
                     const uint8_t* pw = cache.get_tensor(src_stem + ".weight", &lw);
                     const uint8_t* ps = cache.get_tensor(src_stem + ".scales", &ls);
@@ -354,11 +347,11 @@ int main(int argc, char** argv) {
                         [enc endEncoding]; [cb commit]; [cb waitUntilCompleted];
                     }
                     storage.emplace_back((uint8_t*)[b_dw contents], (uint8_t*)[b_dw contents] + dst_w_bytes);
-                    names.push_back(std::string(stem) + ".weight"); dtypes.push_back("U32"); shapes.push_back({ROWS, NG * (size_t)ple_bits});
+                    names.push_back(stem + ".weight"); dtypes.push_back("U32"); shapes.push_back({ROWS, NG * (size_t)ple_bits});
                     storage.emplace_back((uint8_t*)[b_ds contents], (uint8_t*)[b_ds contents] + sb_bytes);
-                    names.push_back(std::string(stem) + ".scales"); dtypes.push_back("BF16"); shapes.push_back({ROWS, NG});
+                    names.push_back(stem + ".scales"); dtypes.push_back("BF16"); shapes.push_back({ROWS, NG});
                     storage.emplace_back((uint8_t*)[b_db contents], (uint8_t*)[b_db contents] + sb_bytes);
-                    names.push_back(std::string(stem) + ".biases"); dtypes.push_back("BF16"); shapes.push_back({ROWS, NG});
+                    names.push_back(stem + ".biases"); dtypes.push_back("BF16"); shapes.push_back({ROWS, NG});
                 }
                 std::vector<const void*> ptrs(storage.size());
                 std::vector<size_t> lens(storage.size());
@@ -428,10 +421,7 @@ int main(int argc, char** argv) {
         const int proj_R[3] = {I, I, H};
         const int proj_C[3] = {H, H, I};
 
-        std::vector<int> layer_list;
-        // --mtp adds the drafter to the requested layers (tfq3 step 3 asks for L47 + MTP in one run).
-        if (!do_mtp || layers_given) for (int l = l_start; l <= l_end; ++l) layer_list.push_back(l);
-        if (do_mtp) layer_list.push_back(48);
+        std::vector<int> layer_list = tfq_flashnext::build_layer_list(l_start, l_end, layers_given, do_mtp);
 
         printf("============================================================================================================\n");
         printf("TFQ3 FLASHNEXT MOE CONVERTER | n5=%d n4=%d n3=%d (avg %.3f bpw) | layers=%zu | out=%s\n",
