@@ -207,7 +207,12 @@ int main(int argc, char** argv) {
         size_t off_meta = sizeof(TfpnHeader);
         size_t off_sc = align_up(off_meta + metas.size() * sizeof(TfpnTensorMeta), ALIGN_16K);
         size_t off_w  = align_up(off_sc + all_scales.size() * 2ULL, ALIGN_16K);
-        TfpnHeader hdr{MAGIC_TFPN, FORMAT_VER, (uint32_t)metas.size(), 0u, off_meta, off_sc, off_w, all_scales.size(), all_weights.size(), 0u};
+        uint64_t xxh = tfq_xxh64::hash_sections3(
+            metas.data(), metas.size() * sizeof(TfpnTensorMeta),
+            all_scales.data(), all_scales.size() * 2ULL,
+            all_weights.data(), all_weights.size() * 4ULL
+        );
+        TfpnHeader hdr{MAGIC_TFPN, FORMAT_VER, (uint32_t)metas.size(), tfq_xxh64::FLAG_XXH64_PRESENT, off_meta, off_sc, off_w, all_scales.size(), all_weights.size(), xxh};
         std::vector<uint8_t> zeros(ALIGN_16K, 0);
         std::string out_path = out_dir + "/nonmoe.tffpw", tmp = out_path + ".tmp";
         FILE* fo = fopen(tmp.c_str(), "wb");
@@ -352,9 +357,14 @@ int main(int argc, char** argv) {
         PrismLayerHeader hdr{};
         hdr.magic = MAGIC_TFPW; hdr.version = FORMAT_VER; hdr.layer_idx = (uint32_t)lyr;
         hdr.num_experts = N_EXP; hdr.num_tensors = N_EXP * 3; hdr.hidden_size = H; hdr.moe_inter = I;
+        hdr.reserved0 = tfq_xxh64::FLAG_XXH64_PRESENT;
         hdr.raw_fp8_bytes = (uint64_t)N_EXP * 3ULL * MAX_E;
         hdr.stream_words = all_weights.size(); hdr.scale_halfs = all_scales.size();
         hdr.off_meta = off_meta; hdr.off_scales = off_sc; hdr.off_weights = off_w;
+        hdr.reserved1[0] = tfq_xxh64::hash(metas.data(), metas.size() * sizeof(PrismExpertMeta));
+        hdr.reserved1[1] = tfq_xxh64::hash(all_scales.data(), all_scales.size() * 2ULL);
+        hdr.reserved1[2] = tfq_xxh64::hash(all_weights.data(), all_weights.size() * 4ULL);
+        hdr.reserved1[3] = 0ULL;
         strncpy((char*)hdr.meta_tag, mode.c_str(), 31);
         std::vector<uint8_t> zeros(ALIGN_16K, 0);
         std::string tmp = std::string(out_path) + ".tmp";

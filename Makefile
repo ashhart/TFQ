@@ -49,7 +49,7 @@ glm: $(BUILD)/tfq3-glm-convert $(BUILD)/tfq3-glm-convert.metallib
 
 inkling2: $(BUILD)/tfq3-inkling2-convert $(BUILD)/tfq3-inkling2-convert.metallib
 
-$(BUILD)/tfq3-inspect: src/tools/tfq3_inspect.cpp | $(BUILD)
+$(BUILD)/tfq3-inspect: src/tools/tfq3_inspect.cpp src/converters/tfq_xxh64.hpp | $(BUILD)
 	$(CXX) $(CXXFLAGS) $< -o $@
 
 $(BUILD)/tfq3-qwen27-package: src/converters/qwen27/package.cpp | $(BUILD)
@@ -59,7 +59,7 @@ $(BUILD)/tfq3-train-tables: src/tools/tfq3_train_tables.cpp src/converters/tfq_c
 	$(CXX) $(CXXFLAGS) $< -o $@
 
 # --- Apple Silicon Metal Targets (encoders use -fno-fast-math for cross-platform bit identity) ---
-METAL_ENC_HDRS := src/converters/tfq_constants.hpp src/converters/canonical_tables.hpp src/converters/tfq_tables_io.hpp
+METAL_ENC_HDRS := src/converters/tfq_constants.hpp src/converters/canonical_tables.hpp src/converters/tfq_tables_io.hpp src/converters/tfq_xxh64.hpp
 
 $(BUILD)/tfq3-generic-convert: src/converters/generic/convert.mm src/converters/generic/planner.hpp $(METAL_ENC_HDRS) | $(BUILD)
 	$(OBJCXX) $< -o $@

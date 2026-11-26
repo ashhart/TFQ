@@ -707,20 +707,23 @@ def write_tfpn_shard(path: str, records: list[dict]) -> int:
     off_weights = align16k(off_scales + sc_arr.nbytes)
     tot_sz = align16k(off_weights + wd_arr.nbytes)
 
+    sc_bytes = sc_arr.tobytes()
+    wd_bytes = wd_arr.tobytes()
+    xxh = tfq3_ref.xxh64_sections((meta_bytes, sc_bytes, wd_bytes))
     hdr = struct.pack(
         "<IIIIQQQQQQ",
-        MAGIC_TFPN, 3, len(records), 0,
+        MAGIC_TFPN, 3, len(records), tfq3_ref.FLAG_XXH64_PRESENT,
         off_meta, off_scales, off_weights,
-        len(sc_arr), len(wd_arr), 0,
+        len(sc_arr), len(wd_arr), xxh,
     )
     with open(path, "wb") as f:
         f.write(hdr)
         f.write(meta_bytes)
         f.write(b"\x00" * (off_scales - (off_meta + len(meta_bytes))))
-        f.write(sc_arr.tobytes())
-        f.write(b"\x00" * (off_weights - (off_scales + sc_arr.nbytes)))
-        f.write(wd_arr.tobytes())
-        f.write(b"\x00" * (tot_sz - (off_weights + wd_arr.nbytes)))
+        f.write(sc_bytes)
+        f.write(b"\x00" * (off_weights - (off_scales + len(sc_bytes))))
+        f.write(wd_bytes)
+        f.write(b"\x00" * (tot_sz - (off_weights + len(wd_bytes))))
     return tot_sz
 
 

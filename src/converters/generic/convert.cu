@@ -18,8 +18,14 @@ static void write_tfpn_shard(const std::string& path, const std::vector<TfpnTens
     const size_t off_weights = (size_t)align16k(off_scales + scales.size() * 2ULL);
     TfpnHeader hdr{};
     hdr.magic = MAGIC_TFPN; hdr.version = FORMAT_VER; hdr.num_tensors = (uint32_t)metas.size();
+    hdr.pad0 = tfq_xxh64::FLAG_XXH64_PRESENT;
     hdr.off_meta = off_meta; hdr.off_scales = off_scales; hdr.off_weights = off_weights;
     hdr.total_scale_halfs = scales.size(); hdr.total_weight_words = weights.size();
+    hdr.pad1 = tfq_xxh64::hash_sections3(
+        metas.data(), metas.size() * sizeof(TfpnTensorMeta),
+        scales.data(), scales.size() * 2ULL,
+        weights.data(), weights.size() * 4ULL
+    );
     std::vector<uint8_t> zeros(ALIGN_16K, 0);
     FILE* fout = fopen(path.c_str(), "wb");
     if (!fout) { fprintf(stderr, "Cannot write %s\n", path.c_str()); exit(1); }

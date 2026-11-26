@@ -17,7 +17,13 @@ import json
 import math
 import os
 import struct
+import sys
 import numpy as np
+
+_REF_DIR = os.path.dirname(os.path.abspath(__file__))
+if _REF_DIR not in sys.path:
+    sys.path.insert(0, _REF_DIR)
+import tfq3_reference as _tfq3_ref
 
 
 def sgn_vec(seed: int, n: int) -> np.ndarray:
@@ -345,9 +351,12 @@ def dequantize_tfp4_tensor(
     lut = load_pwv4_tables(tables_path)
     with open(shard_path, "rb") as f:
         hdr = struct.unpack("<IIIIQQQQQQ", f.read(64))
-        magic, ver, nt, _, off_meta, off_scales, off_weights, _, _, _ = hdr
+        magic, ver, nt, pad0, off_meta, off_scales, off_weights, tot_sc, tot_w, pad1 = hdr
         if magic != MAGIC_TFP4 or ver != TFQ4_VER:
             raise ValueError(f"Bad TFP4 header in {shard_path}")
+        _tfq3_ref.verify_tfpn_like_checksum(
+            f, off_meta, nt * 128, off_scales, tot_sc * 2, off_weights, tot_w * 4, pad0, pad1, f"TFP4 ({shard_path})"
+        )
         f.seek(off_meta)
         found = None
         for _ in range(nt):

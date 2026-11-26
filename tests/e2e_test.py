@@ -39,9 +39,13 @@ ALIGN_16K = 16384
 GOLDEN_PWV3_SHA256 = "956c7abe5d400f302eaf8a2e9d0da50ee18f90d302de786cf6b2ec4905358bb7"
 GOLDEN_PWV4_SHA256 = "ddf28171bd5ea33e2cddc560b5543f6890f2a179bb6dce7082a66243c04b7405"
 GOLDEN_TFQ3_SHARD_SHA256 = {
-    3: "8e6a166749b1d28e4cd20934c9b0d2113a2a846acdbfbaea6d0977e68915fa64",
-    4: "c72b4d88b436404cbc5a21ea63d65419333d0f11fb14fcf5c03c7bb000f1a7d4",
-    5: "cc09a1c7e46881470ea45dde41137cea564a3118d3eab1bfdb8e05f4948f2dac",
+    3: "80969bd2cf4f39a0666f13522d5a80c65149e5aa1ff05a34e7c984e77ee197f4",
+    4: "133acb94b0a2422dc0cd49f3896e8a7dd0f54d8884851628d9e1b4adc31fddef",
+    5: "3ccfaa177e155feb138c8ed7d693df5afd69b84c01fc7571531577641a99d216",
+}
+GOLDEN_TFQ4_SHARD_SHA256 = {
+    "tfq4-00001-of-00002.tffp4": "1199a6fa0d2077b88010b632ef99ff7dcfe24e1d2668e1bbf379486c804a45d8",
+    "tfq4-00002-of-00002.tffp4": "328455b58dc93c2c7b69d0657ba4c69ac2b1d6d75e4e525cab87dab259c29de7",
 }
 
 
@@ -449,6 +453,9 @@ def test_gpu_roundtrips(tfq3_cli: str, inspect_bin: str, model_dir: str, refs: d
 
     tbl4 = os.path.join(out_tfq4, "pw_v4_e8p_tables.bin")
     assert sha256_file(tbl4) == GOLDEN_PWV4_SHA256, "pw_v4_e8p_tables.bin deviates from canonical SHA-256"
+    for fn, exp_sha in GOLDEN_TFQ4_SHARD_SHA256.items():
+        got4 = sha256_file(os.path.join(out_tfq4, fn))
+        assert got4 == exp_sha, f"TFQ4 {fn} cross-platform SHA-256 mismatch: got {got4}, expected {exp_sha}"
     # Padded [192, 256] tensor
     q_name = "model.layers.0.self_attn.q_proj"
     shard_q = find_shard_for_tensor(out_tfq4, ".tffp4", q_name)
@@ -935,6 +942,136 @@ def test_planner_nonfinite(tmp: str) -> None:
     print(f"PASS planner rejects non-finite weights ({len(cases)} dtype/value cases)")
 
 
+def test_xxh64_integrity(inspect_bin: str, tmp: str) -> None:
+    """Verify XXH64 C++==Python parity and 1-byte bit-flip detection across meta, scales, weights of TFPN/TFPW/TFP4."""
+    cxx = "clang++" if platform.system() == "Darwin" else "g++"
+    src = os.path.join(tmp, "test_xxh64.cpp")
+    exe = os.path.join(tmp, "test_xxh64")
+    hdr = os.path.join(REPO_ROOT, "src", "converters", "tfq_xxh64.hpp")
+    with open(src, "w", encoding="utf-8") as f:
+        f.write(
+            f'#include "{hdr}"\n'
+            '#include <cassert>\n'
+            '#include <cstdio>\n'
+            '#include <vector>\n'
+            'int main() {\n'
+            '    assert(tfq_xxh64::hash(nullptr, 0, 0ULL) == 0xEF46DB3751D8E999ULL);\n'
+            '    assert(tfq_xxh64::hash("", 0, 2654435761ULL) == 0xAC75FDA2929B17EFULL);\n'
+            '    std::vector<uint8_t> buf(222);\n'
+            '    uint64_t bg = 2654435761ULL;\n'
+            '    for (size_t i = 0; i < buf.size(); ++i) { buf[i] = (uint8_t)(bg >> 56); bg *= 11400714785074694791ULL; }\n'
+            '    struct Vec { size_t n; uint64_t want; };\n'
+            '    Vec vecs[] = {\n'
+            '        {1, 0xE934A84ADB052768ULL}, {4, 0xE244DDBCF81E29E4ULL}, {8, 0xCA240B08878D6FF6ULL},\n'
+            '        {14, 0xB89B3598E0BD0A0AULL}, {31, 0xB0A1E0B773272144ULL}, {32, 0x91382F920A08001CULL},\n'
+            '        {33, 0x840F6F0A6B922839ULL}, {101, 0x99EC31474028A952ULL}, {222, 0x06CC5BD930BCEC3AULL},\n'
+            '    };\n'
+            '    for (const auto& v : vecs) {\n'
+            '        assert(tfq_xxh64::hash(buf.data(), v.n, 0ULL) == v.want);\n'
+            '        size_t a = v.n / 3, b = (2 * v.n) / 3;\n'
+            '        assert(tfq_xxh64::hash_sections3(buf.data(), a, buf.data() + a, b - a, buf.data() + b, v.n - b) == v.want);\n'
+            '    }\n'
+            '    return 0;\n'
+            '}\n'
+        )
+    run([cxx, "-O2", "-std=c++17", "-Wall", "-Wextra", "-Werror", src, "-o", exe])
+    run([exe])
+
+    d = os.path.join(tmp, "xxh64")
+    os.makedirs(d, exist_ok=True)
+    tbl3 = os.path.join(REPO_ROOT, "reference", "tables", "pw_v3_tables.bin")
+    tbl4 = os.path.join(REPO_ROOT, "reference", "tables", "pw_v4_e8p_tables.bin")
+
+    def flip_byte(src_p: str, dst_p: str, byte_off: int) -> None:
+        raw = bytearray(open(src_p, "rb").read())
+        raw[byte_off] ^= 0x01
+        with open(dst_p, "wb") as fh:
+            fh.write(raw)
+
+    # 1. TFPN: legacy (pad0=0) passes; checksummed (pad0=1) passes; 1-byte flip in meta/scales/weights fails
+    tfpn_leg = os.path.join(d, "legacy_tfpn.tffpw")
+    make_minimal_tfpn(tfpn_leg)
+    run([inspect_bin, tfpn_leg], expect_ok=True)
+    tfq3_ref.dequantize_tfpn_tensor(tfpn_leg, tbl3, "layer", max_blocks=1)
+
+    raw_n = bytearray(open(tfpn_leg, "rb").read())
+    _, _, nt, _, off_m, off_s, off_w, n_sc, n_w, _ = struct.unpack_from("<IIIIQQQQQQ", raw_n, 0)
+    h_tfpn = tfq3_ref.xxh64_sections((raw_n[off_m : off_m + nt * 128], raw_n[off_s : off_s + n_sc * 2], raw_n[off_w : off_w + n_w * 4]))
+    struct.pack_into("<I", raw_n, 12, tfq3_ref.FLAG_XXH64_PRESENT)
+    struct.pack_into("<Q", raw_n, 56, h_tfpn)
+    tfpn_ok = os.path.join(d, "checked_tfpn.tffpw")
+    open(tfpn_ok, "wb").write(raw_n)
+    run([inspect_bin, tfpn_ok], expect_ok=True)
+    tfq3_ref.dequantize_tfpn_tensor(tfpn_ok, tbl3, "layer", max_blocks=1)
+    for sec, off in (("meta", off_m + 1), ("scales", off_s), ("weights", off_w + 17)):
+        bad_p = os.path.join(d, f"bad_tfpn_{sec}.tffpw")
+        flip_byte(tfpn_ok, bad_p, off)
+        proc = run([inspect_bin, bad_p], expect_ok=False)
+        assert "xxh64" in proc.stderr.lower(), proc.stderr
+        try:
+            tfq3_ref.dequantize_tfpn_tensor(bad_p, tbl3, "layer", max_blocks=1)
+            raise AssertionError(f"tfq3_reference accepted corrupted TFPN {sec}")
+        except ValueError as e:
+            assert "xxh64" in str(e).lower(), str(e)
+
+    # 2. TFPW: legacy (reserved0=0) passes; checksummed (reserved0=1) passes; 1-byte flip in meta/scales/weights fails
+    tfpw_leg = os.path.join(d, "legacy_tfpw.tffpw")
+    make_minimal_tfpw(tfpw_leg)
+    run([inspect_bin, tfpw_leg], expect_ok=True)
+    assert tfq3_ref.verify_tfpw_checksum(tfpw_leg) is False
+
+    raw_w = bytearray(open(tfpw_leg, "rb").read())
+    _, _, _, n_exp, _, _, _, _ = struct.unpack_from("<8I", raw_w, 0)
+    _, sw, sh, off_m, off_s, off_w = struct.unpack_from("<6Q", raw_w, 32)
+    hm = tfq3_ref.xxh64(raw_w[off_m : off_m + n_exp * 64])
+    hs = tfq3_ref.xxh64(raw_w[off_s : off_s + sh * 2])
+    hw = tfq3_ref.xxh64(raw_w[off_w : off_w + sw * 4])
+    struct.pack_into("<I", raw_w, 28, tfq3_ref.FLAG_XXH64_PRESENT)
+    struct.pack_into("<4Q", raw_w, 80, hm, hs, hw, 0)
+    tfpw_ok = os.path.join(d, "checked_tfpw.tffpw")
+    open(tfpw_ok, "wb").write(raw_w)
+    run([inspect_bin, tfpw_ok], expect_ok=True)
+    assert tfq3_ref.verify_tfpw_checksum(tfpw_ok) is True
+    for sec, off in (("meta", off_m + 56), ("scales", off_s), ("weights", off_w + 19)):
+        bad_p = os.path.join(d, f"bad_tfpw_{sec}.tffpw")
+        flip_byte(tfpw_ok, bad_p, off)
+        proc = run([inspect_bin, bad_p], expect_ok=False)
+        assert "xxh64" in proc.stderr.lower() and sec in proc.stderr.lower(), proc.stderr
+        try:
+            tfq3_ref.verify_tfpw_checksum(bad_p)
+            raise AssertionError(f"tfq3_reference accepted corrupted TFPW {sec}")
+        except ValueError as e:
+            assert "xxh64" in str(e).lower() and sec in str(e).lower(), str(e)
+
+    # 3. TFP4: legacy (pad0=0) passes; checksummed (pad0=1) passes; 1-byte flip in meta/scales/weights fails
+    tfp4_leg = os.path.join(d, "legacy_tfp4.tffp4")
+    make_minimal_tfp4(tfp4_leg, ["layer.0.proj"])
+    run([inspect_bin, tfp4_leg], expect_ok=True)
+    tfq4_ref.dequantize_tfp4_tensor(tfp4_leg, tbl4, "layer.0.proj", max_blocks=1)
+
+    raw_4 = bytearray(open(tfp4_leg, "rb").read())
+    _, _, nt, _, off_m, off_s, off_w, n_sc, n_w, _ = struct.unpack_from("<IIIIQQQQQQ", raw_4, 0)
+    h_tfp4 = tfq3_ref.xxh64_sections((raw_4[off_m : off_m + nt * 128], raw_4[off_s : off_s + n_sc * 2], raw_4[off_w : off_w + n_w * 4]))
+    struct.pack_into("<I", raw_4, 12, tfq3_ref.FLAG_XXH64_PRESENT)
+    struct.pack_into("<Q", raw_4, 56, h_tfp4)
+    tfp4_ok = os.path.join(d, "checked_tfp4.tffp4")
+    open(tfp4_ok, "wb").write(raw_4)
+    run([inspect_bin, tfp4_ok], expect_ok=True)
+    tfq4_ref.dequantize_tfp4_tensor(tfp4_ok, tbl4, "layer.0.proj", max_blocks=1)
+    for sec, off in (("meta", off_m + 1), ("scales", off_s), ("weights", off_w + 17)):
+        bad_p = os.path.join(d, f"bad_tfp4_{sec}.tffp4")
+        flip_byte(tfp4_ok, bad_p, off)
+        proc = run([inspect_bin, bad_p], expect_ok=False)
+        assert "xxh64" in proc.stderr.lower(), proc.stderr
+        try:
+            tfq4_ref.dequantize_tfp4_tensor(bad_p, tbl4, "layer.0.proj", max_blocks=1)
+            raise AssertionError(f"tfq4_lattice accepted corrupted TFP4 {sec}")
+        except ValueError as e:
+            assert "xxh64" in str(e).lower(), str(e)
+
+    print("PASS XXH64 integrity (C++==Python vectors, legacy flag=0 accepted, 9/9 meta/scales/weights flips caught on TFPN/TFPW/TFP4)")
+
+
 def test_flashnext_mlx_vlm_0712(tmp: str) -> None:
     """Verify FlashNext PR #26 fixes: package.py override preservation + shared Metal/CUDA PLE & --mtp helpers."""
     cxx = "clang++" if platform.system() == "Darwin" else "g++"
@@ -1073,6 +1210,7 @@ def main() -> None:
         test_planner_mlx_bits(tmp)
         test_inspector_negative_controls(inspect_bin, tmp)
         test_inspector_header_checks(inspect_bin, tmp)
+        test_xxh64_integrity(inspect_bin, tmp)
         test_cli_basics(tfq3_cli, model_dir)
         test_planner_write_errors(model_dir, tmp)
         test_install_script(tmp)

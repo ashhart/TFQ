@@ -22,11 +22,195 @@ import numpy as np
 
 MAGIC_PWV3 = 0x33565750
 MAGIC_TFPN = 0x4E504654
+MAGIC_TFPW = 0x57504654
 FORMAT_VER = 3
+FLAG_XXH64_PRESENT = 0x1
 SEED_COL = 0x12345678
 SEED_ROW = 0x9E3779B9
 HASH_MULT = 0x9E3779B1
 INIT_ST_BASE = 0x13579BDF
+
+_XXH_P1 = 0x9E3779B185EBCA87
+_XXH_P2 = 0xC2B2AE3D27D4EB4F
+_XXH_P3 = 0x165667B19E3779F9
+_XXH_P4 = 0x85EBCA77C2B2AE63
+_XXH_P5 = 0x27D4EB2F165667C5
+_XXH_M64 = 0xFFFFFFFFFFFFFFFF
+
+
+def _xxh_rotl64(x: int, r: int) -> int:
+    return ((x << r) | (x >> (64 - r))) & _XXH_M64
+
+
+def _xxh_round64(acc: int, inp: int) -> int:
+    acc = (acc + inp * _XXH_P2) & _XXH_M64
+    acc = ((acc << 31) | (acc >> 33)) & _XXH_M64
+    return (acc * _XXH_P1) & _XXH_M64
+
+
+def _xxh_merge_round64(acc: int, val: int) -> int:
+    val = _xxh_round64(0, val)
+    acc ^= val
+    return (acc * _XXH_P1 + _XXH_P4) & _XXH_M64
+
+
+class XXH64:
+    """Zero-dependency streaming XXH64 (exact match to src/converters/tfq_xxh64.hpp)."""
+
+    def __init__(self, seed: int = 0) -> None:
+        s = seed & _XXH_M64
+        self.total_len = 0
+        self.v1 = (s + _XXH_P1 + _XXH_P2) & _XXH_M64
+        self.v2 = (s + _XXH_P2) & _XXH_M64
+        self.v3 = s
+        self.v4 = (s - _XXH_P1) & _XXH_M64
+        self.buf = bytearray()
+
+    def update(self, data: bytes | bytearray | memoryview) -> None:
+        mv = memoryview(data).cast("B")
+        n = len(mv)
+        if n == 0:
+            return
+        self.total_len += n
+        pos = 0
+        if self.buf:
+            need = 32 - len(self.buf)
+            if n < need:
+                self.buf.extend(mv)
+                return
+            self.buf.extend(mv[:need])
+            k1, k2, k3, k4 = struct.unpack_from("<4Q", self.buf, 0)
+            self.v1 = _xxh_round64(self.v1, k1)
+            self.v2 = _xxh_round64(self.v2, k2)
+            self.v3 = _xxh_round64(self.v3, k3)
+            self.v4 = _xxh_round64(self.v4, k4)
+            self.buf.clear()
+            pos = need
+        rem = n - pos
+        n_stripes = rem >> 5
+        if n_stripes:
+            end = pos + (n_stripes << 5)
+            v1, v2, v3, v4 = self.v1, self.v2, self.v3, self.v4
+            p1, p2, m = _XXH_P1, _XXH_P2, _XXH_M64
+            for k1, k2, k3, k4 in struct.iter_unpack("<4Q", mv[pos:end]):
+                v1 = (v1 + k1 * p2) & m
+                v1 = ((((v1 << 31) | (v1 >> 33)) & m) * p1) & m
+                v2 = (v2 + k2 * p2) & m
+                v2 = ((((v2 << 31) | (v2 >> 33)) & m) * p1) & m
+                v3 = (v3 + k3 * p2) & m
+                v3 = ((((v3 << 31) | (v3 >> 33)) & m) * p1) & m
+                v4 = (v4 + k4 * p2) & m
+                v4 = ((((v4 << 31) | (v4 >> 33)) & m) * p1) & m
+            self.v1, self.v2, self.v3, self.v4 = v1, v2, v3, v4
+            pos = end
+        if pos < n:
+            self.buf.extend(mv[pos:])
+
+    def intdigest(self) -> int:
+        if self.total_len >= 32:
+            h = (
+                _xxh_rotl64(self.v1, 1)
+                + _xxh_rotl64(self.v2, 7)
+                + _xxh_rotl64(self.v3, 12)
+                + _xxh_rotl64(self.v4, 18)
+            ) & _XXH_M64
+            h = _xxh_merge_round64(h, self.v1)
+            h = _xxh_merge_round64(h, self.v2)
+            h = _xxh_merge_round64(h, self.v3)
+            h = _xxh_merge_round64(h, self.v4)
+        else:
+            h = (self.v3 + _XXH_P5) & _XXH_M64
+        h = (h + self.total_len) & _XXH_M64
+        b = self.buf
+        p, end = 0, len(b)
+        while p + 8 <= end:
+            k1 = _xxh_round64(0, struct.unpack_from("<Q", b, p)[0])
+            h ^= k1
+            h = (_xxh_rotl64(h, 27) * _XXH_P1 + _XXH_P4) & _XXH_M64
+            p += 8
+        if p + 4 <= end:
+            h ^= (struct.unpack_from("<I", b, p)[0] * _XXH_P1) & _XXH_M64
+            h = (_xxh_rotl64(h, 23) * _XXH_P2 + _XXH_P3) & _XXH_M64
+            p += 4
+        while p < end:
+            h ^= (b[p] * _XXH_P5) & _XXH_M64
+            h = (_xxh_rotl64(h, 11) * _XXH_P1) & _XXH_M64
+            p += 1
+        h ^= h >> 33
+        h = (h * _XXH_P2) & _XXH_M64
+        h ^= h >> 29
+        h = (h * _XXH_P3) & _XXH_M64
+        h ^= h >> 32
+        return h
+
+
+def xxh64(data: bytes | bytearray | memoryview, seed: int = 0) -> int:
+    st = XXH64(seed)
+    st.update(data)
+    return st.intdigest()
+
+
+def xxh64_sections(sections, seed: int = 0) -> int:
+    st = XXH64(seed)
+    for sec in sections:
+        st.update(sec)
+    return st.intdigest()
+
+
+def _update_xxh64_file_slice(f, off: int, length: int, st: XXH64) -> None:
+    if length == 0:
+        return
+    f.seek(off)
+    rem = length
+    while rem > 0:
+        chunk = f.read(min(rem, 1 << 20))
+        if not chunk:
+            raise ValueError(f"Short read while hashing slice [{off}, {off + length})")
+        st.update(chunk)
+        rem -= len(chunk)
+
+
+def verify_tfpn_like_checksum(f, off_meta: int, meta_bytes: int, off_scales: int, sc_bytes: int,
+                              off_weights: int, w_bytes: int, pad0: int, pad1: int, label: str) -> None:
+    if (pad0 & FLAG_XXH64_PRESENT) == 0:
+        return
+    st = XXH64(0)
+    _update_xxh64_file_slice(f, off_meta, meta_bytes, st)
+    _update_xxh64_file_slice(f, off_scales, sc_bytes, st)
+    _update_xxh64_file_slice(f, off_weights, w_bytes, st)
+    got = st.intdigest()
+    if got != pad1:
+        raise ValueError(f"{label} XXH64 checksum mismatch: got 0x{got:016x}, expected 0x{pad1:016x}")
+
+
+def verify_tfpw_checksum(shard_path: str) -> bool:
+    """Verify per-section XXH64 checksums on a TFPW shard when reserved0 bit 0 is set.
+    Returns True if checksums were verified, False for legacy shards without checksums."""
+    with open(shard_path, "rb") as f:
+        head = f.read(144)
+        if len(head) != 144:
+            raise ValueError(f"Truncated TFPW header in {shard_path}")
+        magic, ver, _, n_exp, _, _, _, reserved0 = struct.unpack_from("<8I", head, 0)
+        if magic != MAGIC_TFPW or ver != FORMAT_VER:
+            raise ValueError(f"Bad TFPW header in {shard_path}")
+        if (reserved0 & FLAG_XXH64_PRESENT) == 0:
+            return False
+        _, sw, sh, off_meta, off_sc, off_w = struct.unpack_from("<6Q", head, 32)
+        exp_meta, exp_sc, exp_w, _ = struct.unpack_from("<4Q", head, 80)
+        for sec_name, off, length, expected in (
+            ("meta", off_meta, n_exp * 64, exp_meta),
+            ("scales", off_sc, sh * 2, exp_sc),
+            ("weights", off_w, sw * 4, exp_w),
+        ):
+            st = XXH64(0)
+            _update_xxh64_file_slice(f, off, length, st)
+            got = st.intdigest()
+            if got != expected:
+                raise ValueError(
+                    f"TFPW {sec_name} XXH64 checksum mismatch in {shard_path}: "
+                    f"got 0x{got:016x}, expected 0x{expected:016x}"
+                )
+        return True
 
 
 def pw_sgn(seed: int, idx: np.ndarray) -> np.ndarray:
@@ -160,9 +344,12 @@ def dequantize_tfpn_tensor(shard_path: str, tables_path: str, tensor_name: str, 
     tbl = load_tables(tables_path)
     with open(shard_path, "rb") as f:
         hdr = struct.unpack("<IIIIQQQQQQ", f.read(64))
-        magic, ver, nt, _, off_meta, off_scales, off_weights, _, _, _ = hdr
+        magic, ver, nt, pad0, off_meta, off_scales, off_weights, tot_sc, tot_w, pad1 = hdr
         if magic != MAGIC_TFPN or ver != FORMAT_VER:
             raise ValueError(f"Bad TFPN header in {shard_path}")
+        verify_tfpn_like_checksum(
+            f, off_meta, nt * 128, off_scales, tot_sc * 2, off_weights, tot_w * 4, pad0, pad1, f"TFPN ({shard_path})"
+        )
         f.seek(off_meta)
         found = None
         for _ in range(nt):
@@ -408,8 +595,31 @@ def self_test() -> None:
 
     kurt_before = float(np.mean(W**4) / (np.mean(W**2) ** 2))
     kurt_after = float(np.mean(W_rot**4) / (np.mean(W_rot**2) ** 2))
+    # Official Cyan4973/xxHash XXH64 test vectors (empty + standard sanity buffer)
+    assert xxh64(b"", 0) == 0xEF46DB3751D8E999
+    assert xxh64(b"", 2654435761) == 0xAC75FDA2929B17EF
+    sbuf = bytearray(222)
+    bg = 2654435761
+    for i in range(len(sbuf)):
+        sbuf[i] = (bg >> 56) & 0xFF
+        bg = (bg * 11400714785074694791) & _XXH_M64
+    for n, expected in (
+        (1, 0xE934A84ADB052768),
+        (4, 0xE244DDBCF81E29E4),
+        (8, 0xCA240B08878D6FF6),
+        (14, 0xB89B3598E0BD0A0A),
+        (31, 0xB0A1E0B773272144),
+        (32, 0x91382F920A08001C),
+        (33, 0x840F6F0A6B922839),
+        (101, 0x99EC31474028A952),
+        (222, 0x06CC5BD930BCEC3A),
+    ):
+        got_one = xxh64(sbuf[:n], 0)
+        got_stream = xxh64_sections((sbuf[: n // 3], sbuf[n // 3 : (2 * n) // 3], sbuf[(2 * n) // 3 : n]), 0)
+        assert got_one == expected and got_stream == expected, f"XXH64 len={n}: {got_one:#x} vs {expected:#x}"
     print(f"PASS 2D FWHT-128 exact invertibility: max_err={max_err:.2e}")
     print(f"PASS Outlier flattening (kurtosis):   before={kurt_before:.1f} -> after={kurt_after:.2f} (Gaussian=3.0)")
+    print("PASS XXH64 reference vectors (one-shot & streaming)")
 
 
 def main() -> None:

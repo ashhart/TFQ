@@ -41,13 +41,13 @@ E2M1_LUT = np.array(
 
 # Verified byte-identical on Apple Silicon Metal and NVIDIA CUDA (sm_121):
 GOLDEN_SHA256 = {
-    "heat43_L0": "6f57bd6daa98c70e266cbdff28e4edbc6cf84ad972d58f9f327d317c153e1d37",
-    "heat43_L1": "fdb905b56e2080b53cf45f928cfa1891cbc0681d074290a704a73a4a4f203f03",
-    "u4_L0":     "814d468f28db0c51a74068ad2650c903b84f534a74ab5a6f0b6632dec7ba8b98",
-    "u4_L1":     "5e7b46f7017d495be5b4112ea46bedf140173fb1b5f13f86ed241a91931a3e3e",
-    "u3_L0":     "400b44aaa145a91aa3fab41f66b3cab96208437a0d8dc46c500f3ee549a7088d",
-    "u3_L1":     "ed710e3b3142ae30f4685e3d03775a78807b29bb2c9db81216bf9d46c4e28187",
-    "nonmoe":    "f50cda145cdbaf9be2e1b1ecf79be522cbc1b7a66c033d6278665580e6fed89d",
+    "heat43_L0": "fcbd0cf5e988c097ca6bea90daad7ce3a12f7324b205c2cff5057c0e576042a8",
+    "heat43_L1": "436210b68207d42d177fa3efcd2bb7e616998c99ef9374e868fcc29d7727d487",
+    "u4_L0":     "455edb1260f905d14cf1d903f9e88338525c05f55f8de13f796a402605b3f3a6",
+    "u4_L1":     "8bbc12e68d7bb3180b40015ecdb1b781c236ef8ee0adc71de274496f44370dbd",
+    "u3_L0":     "6fbec74a7e2227f3e0842823ac290db0c822405a47d23d5336956ecaf6e02aae",
+    "u3_L1":     "f051a4c54bd55875c4d1e04afcc686d67735576b91d7656a935766513f38c186",
+    "nonmoe":    "ca38cf43786c1cd22b40f3358729ca41325163168efdd66e4883a0b165ad55ff",
 }
 
 
@@ -286,6 +286,7 @@ def make_synthetic_inkling2(model_dir: str, E: int = 6, H: int = 256, I: int = 1
 
 
 def verify_tfpw_layer(layer_path: str, tables_path: str, ref_experts: list[dict], expected_bits: dict[int, int]) -> None:
+    assert tfq3_ref.verify_tfpw_checksum(layer_path), f"Expected XXH64 checksums on {layer_path}"
     tbl = tfq3_ref.load_tables(tables_path)
     with open(layer_path, "rb") as f:
         raw = f.read()
@@ -432,6 +433,43 @@ def main() -> None:
         }
         for k, expected in GOLDEN_SHA256.items():
             assert got_hashes[k] == expected, f"Golden SHA-256 mismatch for {k}: got {got_hashes[k]}, expected {expected}"
+
+        # 5b) XXH64 integrity negative controls on real GPU-generated TFPW (layer_00) and TFPN (nonmoe)
+        raw_l0 = bytearray(open(os.path.join(out_heat, "layer_00.tffpw"), "rb").read())
+        _, _, _, n_exp_l0, _, _, _, res0_l0 = struct.unpack_from("<8I", raw_l0, 0)
+        assert (res0_l0 & tfq3_ref.FLAG_XXH64_PRESENT) != 0
+        _, _, _, l0_om, l0_os, l0_ow = struct.unpack_from("<6Q", raw_l0, 32)
+        for sec, off in (("meta", l0_om + 56), ("scales", l0_os), ("weights", l0_ow + 13)):
+            bad_p = os.path.join(tmp, f"flip_tfpw_{sec}.tffpw")
+            mut = bytearray(raw_l0)
+            mut[off] ^= 0x01
+            open(bad_p, "wb").write(mut)
+            p = run([insp_bin, bad_p], expect_ok=False)
+            assert "xxh64" in p.stderr.lower() and sec in p.stderr.lower(), p.stderr
+            try:
+                tfq3_ref.verify_tfpw_checksum(bad_p)
+                raise AssertionError(f"Expected XXH64 failure on TFPW {sec}")
+            except ValueError:
+                pass
+        # Legacy flag=0 TFPW still accepted
+        leg_l0 = os.path.join(tmp, "legacy_l0.tffpw")
+        mut = bytearray(raw_l0)
+        struct.pack_into("<I", mut, 28, 0)
+        struct.pack_into("<4Q", mut, 80, 0, 0, 0, 0)
+        open(leg_l0, "wb").write(mut)
+        run([insp_bin, leg_l0], expect_ok=True)
+        assert tfq3_ref.verify_tfpw_checksum(leg_l0) is False
+
+        raw_nm = bytearray(open(os.path.join(out_nm, "nonmoe.tffpw"), "rb").read())
+        _, _, _, nm_pad0, nm_om, nm_os, nm_ow, _, _, _ = struct.unpack_from("<IIIIQQQQQQ", raw_nm, 0)
+        assert (nm_pad0 & tfq3_ref.FLAG_XXH64_PRESENT) != 0
+        for sec, off in (("meta", nm_om + 1), ("scales", nm_os), ("weights", nm_ow + 13)):
+            bad_p = os.path.join(tmp, f"flip_nonmoe_{sec}.tffpw")
+            mut = bytearray(raw_nm)
+            mut[off] ^= 0x01
+            open(bad_p, "wb").write(mut)
+            p = run([insp_bin, bad_p], expect_ok=False)
+            assert "xxh64" in p.stderr.lower(), p.stderr
 
         # 6) Non-finite rejection
         test_nonfinite_rejection(conv_bin, src_dir, tmp)

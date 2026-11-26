@@ -57,13 +57,13 @@ struct TfpnHeader {
     uint32_t magic;              // 0x4E504654 ("TFPN")
     uint32_t version;            // 3
     uint32_t num_tensors;        // number of TensorMeta entries
-    uint32_t pad0;               // 0
+    uint32_t pad0;               // flags: bit 0 (0x1) = XXH64 checksum present in pad1 (0 = legacy)
     uint64_t off_meta;           // byte offset of TensorMeta[] (>= 64)
     uint64_t off_scales;         // byte offset of half[] scales (16 KiB aligned)
     uint64_t off_weights;        // byte offset of u32[] weights (16 KiB aligned)
     uint64_t total_scale_halfs;  // total fp16 scale elements
     uint64_t total_weight_words; // total u32 weight words
-    uint64_t pad1;               // 0
+    uint64_t pad1;               // XXH64(seed=0) streamed over exact [meta, scales, weights] slices when pad0 & 0x1
 };
 ```
 
@@ -131,14 +131,14 @@ struct TfpwHeader {
     uint32_t num_tensors;    // 3 * num_experts (gate, up, down)
     uint32_t hidden_size;    // model hidden_size (multiple of 128)
     uint32_t moe_inter;      // moe_intermediate_size (multiple of 128)
-    uint32_t reserved0;      // 0
+    uint32_t reserved0;      // flags: bit 0 (0x1) = per-section XXH64 checksums present (0 = legacy)
     uint64_t raw_fp8_bytes;  // uncompressed reference byte count
     uint64_t stream_words;   // total u32 weight words
     uint64_t scale_halfs;    // total fp16 scale elements
     uint64_t off_meta;       // byte offset of TfpwExpertMeta[num_experts]
     uint64_t off_scales;     // 16 KiB aligned fp16 scales section
     uint64_t off_weights;    // 16 KiB aligned u32 weights section
-    uint64_t reserved1[4];   // 0
+    uint64_t reserved1[4];   // when reserved0 & 0x1: [0]=XXH64(meta), [1]=XXH64(scales), [2]=XXH64(weights), [3]=0 (seed=0)
     char     meta_tag[32];   // NUL-terminated profile/tag label
 };
 ```
@@ -173,6 +173,10 @@ Any compliant reader (and `build/tfq3-inspect`) enforces:
 4. All arithmetic checked against 64-bit integer overflow.
 5. Every tensor/expert has `bits ∈ {3, 4, 5}`, `R > 0`, `C > 0`, `R % 128 == 0`, `C % 128 == 0`, exact expected `word_count`, and offsets strictly inside `[0, total_scale_halfs]` and `[0, total_weight_words]`.
 6. No duplicate tensor names across multi-shard `TFPN` directories.
+7. **Integrity checksums (`XXH64`, seed `0`, backwards-compatible):**
+   - `TFPN` and `TFP4`: when `pad0 & 0x1` is set, `pad1` must equal `XXH64(seed=0)` streamed over the exact payload slices `[off_meta .. +num_tensors*128)`, `[off_scales .. +total_scale_halfs*2)`, `[off_weights .. +total_weight_words*4)` (excluding inter-section zero padding).
+   - `TFPW`: when `reserved0 & 0x1` is set, `reserved1[0..2]` must equal the independent `XXH64(seed=0)` digests of `meta`, `scales`, and `weights`.
+   - Legacy shards with flag bit `0` cleared (`0`) remain valid. All converters set the flag bit and checksums unconditionally; `tfq3-inspect` and reference readers verify them whenever present.
 
 ---
 

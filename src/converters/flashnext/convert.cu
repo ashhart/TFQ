@@ -296,9 +296,14 @@ int main(int argc, char** argv) {
         PrismLayerHeader hdr{};
         hdr.magic = MAGIC_TFPW; hdr.version = FORMAT_VER; hdr.layer_idx = (uint32_t)lyr;
         hdr.num_experts = N_EXP; hdr.num_tensors = N_EXP * 3; hdr.hidden_size = H; hdr.moe_inter = I;
+        hdr.reserved0 = tfq_xxh64::FLAG_XXH64_PRESENT;
         hdr.raw_fp8_bytes = (uint64_t)N_EXP * 3ULL * MAX_ELEMS;
         hdr.stream_words = all_weights.size(); hdr.scale_halfs = all_scales.size();
         hdr.off_meta = off_meta; hdr.off_scales = off_sc; hdr.off_weights = off_w;
+        hdr.reserved1[0] = tfq_xxh64::hash(metas.data(), metas.size() * sizeof(PrismExpertMeta));
+        hdr.reserved1[1] = tfq_xxh64::hash(all_scales.data(), all_scales.size() * 2ULL);
+        hdr.reserved1[2] = tfq_xxh64::hash(all_weights.data(), all_weights.size() * 4ULL);
+        hdr.reserved1[3] = 0ULL;
         snprintf((char*)hdr.meta_tag, 32, "fn_v3_%s", tag.c_str());
         std::vector<uint8_t> zeros(ALIGN_16K, 0);
         std::string tmp = std::string(out_path) + ".tmp";

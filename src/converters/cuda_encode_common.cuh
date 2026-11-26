@@ -7,6 +7,7 @@
 // files identical to the Apple Silicon Metal converter suite.
 // ============================================================================
 #include "tfq_tables_io.hpp"
+#include "tfq_xxh64.hpp"
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <algorithm>

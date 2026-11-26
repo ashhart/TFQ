@@ -21,6 +21,7 @@
 #include <vector>
 #include "../moe_heat_rank.hpp"
 #include "../tfq_tables_io.hpp"
+#include "../tfq_xxh64.hpp"
 
 // ============================================================================
 // TFF-PrismWave v3 (2D-AffineCoset/half4) Production GPU Converter (Apple M5)
@@ -31,7 +32,6 @@
 
 static constexpr uint32_t MAGIC_TFPW = 0x57504654u; // "TFPW"
 static constexpr uint32_t MAGIC_TFPN = 0x4E504654u; // "TFPN"
-static constexpr uint32_t MAGIC_PWV3 = 0x33565750u; // "PWV3"
 static constexpr uint32_t FORMAT_VER = 3u;
 static constexpr size_t   ALIGN_16K  = 16384;
 
@@ -521,24 +521,34 @@ int main(int argc, char** argv) {
             uint64_t off_weights = align_up(off_scales + all_scales.size() * 2ULL, ALIGN_16K);
             NonMoeHeader hdr{};
             hdr.magic = MAGIC_TFPN; hdr.version = FORMAT_VER; hdr.num_tensors = (uint32_t)metas.size();
+            hdr.pad0 = tfq_xxh64::FLAG_XXH64_PRESENT;
             hdr.off_meta = off_meta; hdr.off_scales = off_scales; hdr.off_weights = off_weights;
             hdr.total_scale_halfs = all_scales.size(); hdr.total_weight_words = all_weights.size();
+            hdr.pad1 = tfq_xxh64::hash_sections3(
+                metas.data(), metas.size() * sizeof(NonMoeTensorMeta),
+                all_scales.data(), all_scales.size() * 2ULL,
+                all_weights.data(), all_weights.size() * 4ULL
+            );
 
             std::string out_path = out_dir + "/nonmoe.tffpw";
+            auto write_all = [&](FILE* f, const void* p, size_t n) {
+                if (n && fwrite(p, 1, n, f) != n) { fprintf(stderr, "Write error on %s\n", out_path.c_str()); exit(1); }
+            };
             FILE* fout = fopen(out_path.c_str(), "wb");
-            fwrite(&hdr, 1, sizeof(hdr), fout);
-            fwrite(metas.data(), sizeof(NonMoeTensorMeta), metas.size(), fout);
+            if (!fout) { fprintf(stderr, "Cannot write %s\n", out_path.c_str()); return 1; }
+            write_all(fout, &hdr, sizeof(hdr));
+            write_all(fout, metas.data(), metas.size() * sizeof(NonMoeTensorMeta));
             size_t cur = off_meta + metas.size() * sizeof(NonMoeTensorMeta);
             std::vector<uint8_t> zeros(ALIGN_16K, 0);
-            if (off_scales > cur) fwrite(zeros.data(), 1, off_scales - cur, fout);
-            fwrite(all_scales.data(), 2, all_scales.size(), fout);
+            if (off_scales > cur) write_all(fout, zeros.data(), off_scales - cur);
+            write_all(fout, all_scales.data(), all_scales.size() * 2ULL);
             cur = off_scales + all_scales.size() * 2ULL;
-            if (off_weights > cur) fwrite(zeros.data(), 1, off_weights - cur, fout);
-            fwrite(all_weights.data(), 4, all_weights.size(), fout);
+            if (off_weights > cur) write_all(fout, zeros.data(), off_weights - cur);
+            write_all(fout, all_weights.data(), all_weights.size() * 4ULL);
             size_t end_pos = off_weights + all_weights.size() * 4ULL;
             size_t pad_end = align_up(end_pos, ALIGN_16K) - end_pos;
-            if (pad_end) fwrite(zeros.data(), 1, pad_end, fout);
-            fclose(fout);
+            if (pad_end) write_all(fout, zeros.data(), pad_end);
+            if (fclose(fout) != 0) { fprintf(stderr, "Write error on %s\n", out_path.c_str()); return 1; }
             double el = std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - t0).count();
             printf("NON-MOE DONE in %.1fs -> %s (%.3f GB) | Mean SNR: 4b=%.2f dB (n=%d), 5b=%.2f dB (n=%d)\n",
                    el, out_path.c_str(), (double)(end_pos + pad_end) / 1e9,
@@ -744,27 +754,36 @@ int main(int argc, char** argv) {
             PrismLayerHeader hdr{};
             hdr.magic = MAGIC_TFPW; hdr.version = FORMAT_VER; hdr.layer_idx = (uint32_t)lyr;
             hdr.num_experts = N_EXP; hdr.num_tensors = N_EXP * 3; hdr.hidden_size = H; hdr.moe_inter = I;
+            hdr.reserved0 = tfq_xxh64::FLAG_XXH64_PRESENT;
             hdr.raw_fp8_bytes = (uint64_t)N_EXP * 3ULL * H * I;
             hdr.stream_words = all_weights.size(); hdr.scale_halfs = all_scales.size();
             hdr.off_meta = off_meta; hdr.off_scales = off_scales; hdr.off_weights = off_weights;
+            hdr.reserved1[0] = tfq_xxh64::hash(metas.data(), metas.size() * sizeof(PrismExpertMeta));
+            hdr.reserved1[1] = tfq_xxh64::hash(all_scales.data(), all_scales.size() * 2ULL);
+            hdr.reserved1[2] = tfq_xxh64::hash(all_weights.data(), all_weights.size() * 4ULL);
+            hdr.reserved1[3] = 0ULL;
             snprintf((char*)hdr.meta_tag, 32, "v3_%s", mode.c_str());
 
             std::string tmp_path = std::string(out_path) + ".tmp";
+            auto write_all = [&](FILE* f, const void* p, size_t n) {
+                if (n && fwrite(p, 1, n, f) != n) { fprintf(stderr, "Write error on %s\n", tmp_path.c_str()); exit(1); }
+            };
             FILE* fout = fopen(tmp_path.c_str(), "wb");
-            fwrite(&hdr, 1, sizeof(hdr), fout);
-            fwrite(metas.data(), sizeof(PrismExpertMeta), metas.size(), fout);
+            if (!fout) { fprintf(stderr, "Cannot write %s\n", tmp_path.c_str()); return 1; }
+            write_all(fout, &hdr, sizeof(hdr));
+            write_all(fout, metas.data(), metas.size() * sizeof(PrismExpertMeta));
             std::vector<uint8_t> zeros(ALIGN_16K, 0);
             size_t cur = off_meta + metas.size() * sizeof(PrismExpertMeta);
-            if (off_scales > cur) fwrite(zeros.data(), 1, off_scales - cur, fout);
-            fwrite(all_scales.data(), 2, all_scales.size(), fout);
+            if (off_scales > cur) write_all(fout, zeros.data(), off_scales - cur);
+            write_all(fout, all_scales.data(), all_scales.size() * 2ULL);
             cur = off_scales + all_scales.size() * 2ULL;
-            if (off_weights > cur) fwrite(zeros.data(), 1, off_weights - cur, fout);
-            fwrite(all_weights.data(), 4, all_weights.size(), fout);
+            if (off_weights > cur) write_all(fout, zeros.data(), off_weights - cur);
+            write_all(fout, all_weights.data(), all_weights.size() * 4ULL);
             size_t end_pos = off_weights + all_weights.size() * 4ULL;
             size_t pad_end = align_up(end_pos, ALIGN_16K) - end_pos;
-            if (pad_end) fwrite(zeros.data(), 1, pad_end, fout);
-            fclose(fout);
-            rename(tmp_path.c_str(), out_path);
+            if (pad_end) write_all(fout, zeros.data(), pad_end);
+            if (fclose(fout) != 0) { fprintf(stderr, "Write error on %s\n", tmp_path.c_str()); return 1; }
+            if (rename(tmp_path.c_str(), out_path) != 0) { fprintf(stderr, "Cannot rename %s to %s\n", tmp_path.c_str(), out_path); return 1; }
 
             double dt = std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - t_lyr).count();
             double tot_dt = std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - t_all).count();

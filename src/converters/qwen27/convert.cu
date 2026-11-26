@@ -20,11 +20,17 @@ static void write_tfpn_shard(
     hdr.magic              = MAGIC_TFPN;
     hdr.version            = FORMAT_VER;
     hdr.num_tensors        = (uint32_t)metas.size();
+    hdr.pad0               = tfq_xxh64::FLAG_XXH64_PRESENT;
     hdr.off_meta           = off_meta;
     hdr.off_scales         = off_scales;
     hdr.off_weights        = off_weights;
     hdr.total_scale_halfs  = all_scales.size();
     hdr.total_weight_words = all_weights.size();
+    hdr.pad1               = tfq_xxh64::hash_sections3(
+        metas.data(), metas.size() * sizeof(TfpnTensorMeta),
+        all_scales.data(), all_scales.size() * 2ULL,
+        all_weights.data(), all_weights.size() * 4ULL
+    );
 
     std::vector<uint8_t> zeros(ALIGN_16K, 0);
     FILE* fout = fopen(path.c_str(), "wb");

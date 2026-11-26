@@ -184,7 +184,8 @@ int main(int argc, char** argv) {
             for (uint32_t ci = 0; ci < hdr[1]; ++ci) {
                 uint32_t ch[10] = {};
                 if (fread(ch, 4, 10, vf) != 10) { fprintf(stderr, "Truncated VEC3 case %u\n", ci); fclose(vf); return 1; }
-                uint32_t bits = ch[0], R = ch[1], C = ch[2], rows = ch[3], r_off = ch[4], c_off = ch[5], n_loc = ch[6], k_loc = ch[7];
+                uint32_t bits = ch[0], C = ch[2], rows = ch[3], r_off = ch[4], c_off = ch[5], n_loc = ch[6], k_loc = ch[7];
+                (void)ch[1];
                 uint32_t n_words = ch[8], n_scales = ch[9];
                 std::vector<uint32_t> W(n_words);
                 std::vector<uint16_t> sc(n_scales), X((size_t)rows * k_loc);

@@ -12,6 +12,7 @@
 #include <sys/stat.h>
 #include <unordered_set>
 #include <vector>
+#include "../converters/tfq_xxh64.hpp"
 
 static constexpr uint32_t MAGIC_PWV3 = 0x33565750u;
 static constexpr uint32_t MAGIC_PWV4 = 0x34565750u;
@@ -167,9 +168,24 @@ static bool inspect_tfpn(const std::string& path, bool verbose, std::unordered_s
         fclose(f); fprintf(stderr, "FAIL %s: section overlap or truncation\n", path.c_str()); return false;
     }
     std::vector<TfpnTensorMeta> metas(h.num_tensors);
-    if (fseek(f, (long)h.off_meta, SEEK_SET) != 0 ||
+    if (fseeko(f, static_cast<off_t>(h.off_meta), SEEK_SET) != 0 ||
         (h.num_tensors > 0 && fread(metas.data(), sizeof(TfpnTensorMeta), h.num_tensors, f) != h.num_tensors)) {
         fclose(f); fprintf(stderr, "FAIL %s: short read\n", path.c_str()); return false;
+    }
+    if ((h.pad0 & tfq_xxh64::FLAG_XXH64_PRESENT) != 0u) {
+        tfq_xxh64::State st(0ULL);
+        st.update(metas.data(), static_cast<size_t>(meta_bytes));
+        if (!tfq_xxh64::update_from_file(f, h.off_scales, sc_bytes, st) ||
+            !tfq_xxh64::update_from_file(f, h.off_weights, w_bytes, st)) {
+            fclose(f); fprintf(stderr, "FAIL %s: short read during XXH64 verification\n", path.c_str()); return false;
+        }
+        const uint64_t got = st.digest();
+        if (got != h.pad1) {
+            fclose(f);
+            fprintf(stderr, "FAIL %s: TFPN XXH64 checksum mismatch (got 0x%016llx, expected 0x%016llx)\n",
+                    path.c_str(), (unsigned long long)got, (unsigned long long)h.pad1);
+            return false;
+        }
     }
     fclose(f);
 
@@ -258,9 +274,35 @@ static bool inspect_tfpw(const std::string& path) {
         fclose(f); fprintf(stderr, "FAIL %s: section overlap or truncation\n", path.c_str()); return false;
     }
     std::vector<TfpwExpertMeta> metas(h.num_experts);
-    if (fseek(f, (long)h.off_meta, SEEK_SET) != 0 ||
+    if (fseeko(f, static_cast<off_t>(h.off_meta), SEEK_SET) != 0 ||
         (h.num_experts > 0 && fread(metas.data(), sizeof(TfpwExpertMeta), h.num_experts, f) != h.num_experts)) {
         fclose(f); fprintf(stderr, "FAIL %s: short read\n", path.c_str()); return false;
+    }
+    if ((h.reserved0 & tfq_xxh64::FLAG_XXH64_PRESENT) != 0u) {
+        const uint64_t got_meta = tfq_xxh64::hash(metas.data(), static_cast<size_t>(meta_bytes));
+        if (got_meta != h.reserved1[0]) {
+            fclose(f);
+            fprintf(stderr, "FAIL %s: TFPW XXH64 meta checksum mismatch (got 0x%016llx, expected 0x%016llx)\n",
+                    path.c_str(), (unsigned long long)got_meta, (unsigned long long)h.reserved1[0]);
+            return false;
+        }
+        uint64_t got_sc = 0ULL, got_w = 0ULL;
+        if (!tfq_xxh64::hash_file_slice(f, h.off_scales, sc_bytes, got_sc) ||
+            !tfq_xxh64::hash_file_slice(f, h.off_weights, w_bytes, got_w)) {
+            fclose(f); fprintf(stderr, "FAIL %s: short read during XXH64 verification\n", path.c_str()); return false;
+        }
+        if (got_sc != h.reserved1[1]) {
+            fclose(f);
+            fprintf(stderr, "FAIL %s: TFPW XXH64 scales checksum mismatch (got 0x%016llx, expected 0x%016llx)\n",
+                    path.c_str(), (unsigned long long)got_sc, (unsigned long long)h.reserved1[1]);
+            return false;
+        }
+        if (got_w != h.reserved1[2]) {
+            fclose(f);
+            fprintf(stderr, "FAIL %s: TFPW XXH64 weights checksum mismatch (got 0x%016llx, expected 0x%016llx)\n",
+                    path.c_str(), (unsigned long long)got_w, (unsigned long long)h.reserved1[2]);
+            return false;
+        }
     }
     fclose(f);
 
@@ -357,11 +399,28 @@ static bool inspect_tfp4(const std::string& path, bool verbose, std::unordered_s
         return false;
     }
     std::vector<TfpnTensorMeta> metas(h.num_tensors);
-    if (fseek(f, (long)h.off_meta, SEEK_SET) != 0 ||
+    if (fseeko(f, static_cast<off_t>(h.off_meta), SEEK_SET) != 0 ||
         (h.num_tensors > 0 && fread(metas.data(), sizeof(TfpnTensorMeta), h.num_tensors, f) != h.num_tensors)) {
         fclose(f);
         fprintf(stderr, "FAIL %s: short read\n", path.c_str());
         return false;
+    }
+    if ((h.pad0 & tfq_xxh64::FLAG_XXH64_PRESENT) != 0u) {
+        tfq_xxh64::State st(0ULL);
+        st.update(metas.data(), static_cast<size_t>(meta_bytes));
+        if (!tfq_xxh64::update_from_file(f, h.off_scales, sc_bytes, st) ||
+            !tfq_xxh64::update_from_file(f, h.off_weights, w_bytes, st)) {
+            fclose(f);
+            fprintf(stderr, "FAIL %s: short read during XXH64 verification\n", path.c_str());
+            return false;
+        }
+        const uint64_t got = st.digest();
+        if (got != h.pad1) {
+            fclose(f);
+            fprintf(stderr, "FAIL %s: TFP4 XXH64 checksum mismatch (got 0x%016llx, expected 0x%016llx)\n",
+                    path.c_str(), (unsigned long long)got, (unsigned long long)h.pad1);
+            return false;
+        }
     }
     fclose(f);
 

@@ -7,6 +7,7 @@
 // ============================================================================
 #include "../canonical_tables.hpp"
 #include "../tfq_constants.hpp"
+#include "../tfq_xxh64.hpp"
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -131,11 +132,17 @@ static inline uint64_t write_tfp4_shard(
     hdr.magic = MAGIC_TFP4;
     hdr.version = FORMAT_VER;
     hdr.num_tensors = (uint32_t)metas.size();
+    hdr.pad0 = tfq_xxh64::FLAG_XXH64_PRESENT;
     hdr.off_meta = off_meta;
     hdr.off_scales = off_sc;
     hdr.off_weights = off_wt;
     hdr.total_scale_halfs = scales.size();
     hdr.total_weight_words = words.size();
+    hdr.pad1 = tfq_xxh64::hash_sections3(
+        metas.data(), metas.size() * sizeof(Tfp4TensorMeta),
+        scales.data(), scales.size() * 2ull,
+        words.data(), words.size() * 4ull
+    );
 
     std::ofstream ofs(path, std::ios::binary);
     if (!ofs.good()) {
