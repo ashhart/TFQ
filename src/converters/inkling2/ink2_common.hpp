@@ -506,11 +506,20 @@ static inline void export_residuals_and_assets(
     ink2::close_or_exit(fi, idx_tmp);
     ink2::rename_or_exit(idx_tmp, idx_out);
 
-    // Copy non-safetensors metadata / tokenizer / config assets
+    // Copy non-safetensors metadata / tokenizer / config assets (plus standalone MTP drafter & tiktoken if present)
     for (const char* f : {"config.json", "generation_config.json", "chat_template.jinja",
                           "tokenizer.json", "tokenizer_config.json", "special_tokens_map.json",
-                          "preprocessor_config.json", "processor_config.json", "LICENSE"}) {
+                          "preprocessor_config.json", "processor_config.json", "LICENSE",
+                          "mtp.safetensors"}) {
         copy_small_file(model_dir + "/" + f, out_dir + "/" + f);
+    }
+    {
+        struct stat tst{};
+        std::string tk_src = model_dir + "/tiktoken/tokenizer.model";
+        if (stat(tk_src.c_str(), &tst) == 0 && S_ISREG(tst.st_mode)) {
+            mkdir((out_dir + "/tiktoken").c_str(), 0755);
+            copy_small_file(tk_src, out_dir + "/tiktoken/tokenizer.model");
+        }
     }
     printf("RESIDUALS EXPORTED: %zu tensors -> %d shard(s) (%.3f GiB)\n",
            keep.size(), n_sh, (double)total_res_bytes / (double)(1ULL << 30));

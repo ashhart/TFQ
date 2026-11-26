@@ -222,7 +222,7 @@ elif mt == "qwen4_exp":
     family = "flashnext"
 elif mt in ("glm5_next", "glm_moe_dsa"):
     family = "glm"
-elif mt == "inkling2":
+elif mt in ("inkling2", "inkling2_loop"):
     family = "inkling2"
 elif mt == "ernie5_5_moe":
     family = "ernie"
