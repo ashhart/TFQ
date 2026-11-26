@@ -245,6 +245,7 @@ int main(int argc, char** argv) {
     std::string metallib    = default_metallib("tfq3-flashnext-convert.metallib");
     std::string tables_path = "";
     int l_start = 0, l_end = 47;
+    bool layers_given = false;
     int n5 = 0, n4 = 192;
     int ple_bits = 3;
     bool do_mtp = false;
@@ -260,7 +261,7 @@ int main(int argc, char** argv) {
         else if (a == "--mode" && i + 1 < argc) mode = argv[++i];
         else if (a == "--metallib" && i + 1 < argc) metallib = argv[++i];
         else if (a == "--tables" && i + 1 < argc) tables_path = argv[++i];
-        else if (a == "--layers" && i + 2 < argc) { l_start = atoi(argv[++i]); l_end = atoi(argv[++i]); }
+        else if (a == "--layers" && i + 2 < argc) { l_start = atoi(argv[++i]); l_end = atoi(argv[++i]); layers_given = true; }
         else if (a == "--n5" && i + 1 < argc) n5 = atoi(argv[++i]);
         else if (a == "--n4" && i + 1 < argc) n4 = atoi(argv[++i]);
         else if (a == "--ple-bits" && i + 1 < argc) ple_bits = atoi(argv[++i]);
@@ -318,10 +319,17 @@ int main(int argc, char** argv) {
                 for (int s = grp * 16; s < grp * 16 + 16; ++s) {
                     char stem[192];
                     snprintf(stem, sizeof(stem), "language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shard_%d", s);
+                    // mlx-vlm >= 0.7.12 names these ngram_embedding.shards.N; older builds use shard_N.
+                    std::string src_stem(stem);
+                    if (cache.weight_map.find(src_stem + ".weight") == cache.weight_map.end()) {
+                        char alt[192];
+                        snprintf(alt, sizeof(alt), "language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.%d", s);
+                        src_stem = alt;
+                    }
                     size_t lw = 0, ls = 0, lb = 0;
-                    const uint8_t* pw = cache.get_tensor(std::string(stem) + ".weight", &lw);
-                    const uint8_t* ps = cache.get_tensor(std::string(stem) + ".scales", &ls);
-                    const uint8_t* pb = cache.get_tensor(std::string(stem) + ".biases", &lb);
+                    const uint8_t* pw = cache.get_tensor(src_stem + ".weight", &lw);
+                    const uint8_t* ps = cache.get_tensor(src_stem + ".scales", &ls);
+                    const uint8_t* pb = cache.get_tensor(src_stem + ".biases", &lb);
                     if (lw != src_w_bytes || ls != sb_bytes || lb != sb_bytes) {
                         fprintf(stderr, "Unexpected PLE shard_%d sizes: %zu %zu %zu\n", s, lw, ls, lb);
                         return 2;
@@ -420,8 +428,9 @@ int main(int argc, char** argv) {
         const int proj_C[3] = {H, H, I};
 
         std::vector<int> layer_list;
+        // --mtp adds the drafter to the requested layers (tfq3 step 3 asks for L47 + MTP in one run).
+        if (!do_mtp || layers_given) for (int l = l_start; l <= l_end; ++l) layer_list.push_back(l);
         if (do_mtp) layer_list.push_back(48);
-        else for (int l = l_start; l <= l_end; ++l) layer_list.push_back(l);
 
         printf("============================================================================================================\n");
         printf("TFQ3 FLASHNEXT MOE CONVERTER | n5=%d n4=%d n3=%d (avg %.3f bpw) | layers=%zu | out=%s\n",

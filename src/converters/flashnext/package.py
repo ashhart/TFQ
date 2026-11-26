@@ -148,6 +148,13 @@ def write_index_and_config(src_dir: str, out_dir: str, ple_bits: int, ple_dir: s
         for s in range(128):
             key = f"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shard_{s}"
             q_obj[key] = {"group_size": 32, "bits": ple_bits, "mode": "affine"}
+    # Carry the source's per-tensor width overrides (newer mlx-vlm stores router gates at 8-bit/64)
+    # for every tensor still in the packaged index; PLE shards get their own entries above.
+    src_q = cfg.get("quantization") or cfg.get("quantization_config") or {}
+    packaged = {k.rsplit(".", 1)[0] for k in weight_map}
+    for k, v in src_q.items():
+        if isinstance(v, dict) and ".ngram_embedding." not in k and k in packaged and k not in q_obj:
+            q_obj[k] = v
     cfg["quantization"] = q_obj
     cfg["quantization_config"] = q_obj
     if isinstance(cfg.get("text_config"), dict):
