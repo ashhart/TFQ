@@ -20,7 +20,7 @@ PREFIX    ?= $(HOME)/.local
 BINDIR    := $(PREFIX)/bin
 LIBDIR    := $(PREFIX)/lib/tfq3
 
-.PHONY: all metal cuda hip generic qwen27 flashnext glm tfq4 tools test test-metal test-tfq4-metal test-cuda test-hip install uninstall clean
+.PHONY: all metal cuda hip generic qwen27 flashnext glm inkling2 tfq4 tools test test-metal test-tfq4-metal test-cuda test-hip install uninstall clean
 
 ifeq ($(UNAME_S),Darwin)
 all: tools metal
@@ -33,9 +33,9 @@ $(BUILD):
 
 tools: $(BUILD)/tfq3-inspect $(BUILD)/tfq3-qwen27-package $(BUILD)/tfq3-train-tables
 
-metal: generic qwen27 flashnext glm tfq4 $(BUILD)/tfq3-metal-test $(BUILD)/tfq3-metal-test.metallib $(BUILD)/tfq4-metal-test $(BUILD)/tfq4-metal-test.metallib
+metal: generic qwen27 flashnext glm inkling2 tfq4 $(BUILD)/tfq3-metal-test $(BUILD)/tfq3-metal-test.metallib $(BUILD)/tfq4-metal-test $(BUILD)/tfq4-metal-test.metallib
 
-cuda: tools $(BUILD)/tfq3-generic-convert-cuda $(BUILD)/tfq3-qwen27-convert-cuda $(BUILD)/tfq3-flashnext-convert-cuda $(BUILD)/tfq3-glm-convert-cuda $(BUILD)/tfq3-ernie-convert-cuda $(BUILD)/tfq4-convert-cuda $(BUILD)/tfq3-cuda-test
+cuda: tools $(BUILD)/tfq3-generic-convert-cuda $(BUILD)/tfq3-qwen27-convert-cuda $(BUILD)/tfq3-flashnext-convert-cuda $(BUILD)/tfq3-glm-convert-cuda $(BUILD)/tfq3-inkling2-convert-cuda $(BUILD)/tfq3-ernie-convert-cuda $(BUILD)/tfq4-convert-cuda $(BUILD)/tfq3-cuda-test
 
 generic: $(BUILD)/tfq3-generic-convert $(BUILD)/tfq3-generic-convert.metallib
 
@@ -46,6 +46,8 @@ qwen27: $(BUILD)/tfq3-qwen27-convert $(BUILD)/tfq3-qwen27-convert.metallib $(BUI
 flashnext: $(BUILD)/tfq3-flashnext-convert $(BUILD)/tfq3-flashnext-convert.metallib
 
 glm: $(BUILD)/tfq3-glm-convert $(BUILD)/tfq3-glm-convert.metallib
+
+inkling2: $(BUILD)/tfq3-inkling2-convert $(BUILD)/tfq3-inkling2-convert.metallib
 
 $(BUILD)/tfq3-inspect: src/tools/tfq3_inspect.cpp | $(BUILD)
 	$(CXX) $(CXXFLAGS) $< -o $@
@@ -91,6 +93,14 @@ $(BUILD)/tfq3-glm-convert.metallib: src/converters/glm/convert.metal src/convert
 	$(METALLIB) $(BUILD)/glm.air -o $@
 	@rm -f $(BUILD)/glm.air
 
+$(BUILD)/tfq3-inkling2-convert: src/converters/inkling2/convert.mm src/converters/inkling2/ink2_common.hpp $(METAL_ENC_HDRS) | $(BUILD)
+	$(OBJCXX) $< -o $@
+
+$(BUILD)/tfq3-inkling2-convert.metallib: src/converters/inkling2/convert.metal src/converters/metal_encode_common.metal | $(BUILD)
+	$(METAL) $(METAL_ENC_FLAGS) -c $< -o $(BUILD)/inkling2.air
+	$(METALLIB) $(BUILD)/inkling2.air -o $@
+	@rm -f $(BUILD)/inkling2.air
+
 $(BUILD)/tfq3-metal-test: src/tools/tfq3_metal_bench.mm | $(BUILD)
 	$(OBJCXX) $< -o $@
 
@@ -132,6 +142,9 @@ $(BUILD)/tfq3-flashnext-convert-cuda: src/converters/flashnext/convert.cu src/co
 $(BUILD)/tfq3-glm-convert-cuda: src/converters/glm/convert.cu src/converters/cuda_encode_common.cuh src/converters/moe_heat_rank.hpp $(METAL_ENC_HDRS) | $(BUILD)
 	$(NVCC) $(NVCC_ENC_FLAGS) $< -o $@
 
+$(BUILD)/tfq3-inkling2-convert-cuda: src/converters/inkling2/convert.cu src/converters/inkling2/ink2_common.hpp src/converters/cuda_encode_common.cuh $(METAL_ENC_HDRS) | $(BUILD)
+	$(NVCC) $(NVCC_ENC_FLAGS) $< -o $@
+
 $(BUILD)/tfq3-ernie-convert-cuda: src/converters/ernie/convert.cu src/converters/cuda_encode_common.cuh $(METAL_ENC_HDRS) | $(BUILD)
 	$(NVCC) $(NVCC_ENC_FLAGS) $< -o $@
 
@@ -155,6 +168,7 @@ test: all
 	@python3 reference/tfq4_lattice.py --self-test
 	@python3 tests/vectors_test.py
 	@python3 tests/e2e_test.py
+	@python3 tests/inkling2_test.py
 	@if [ "$(UNAME_S)" = "Darwin" ] && [ -x "$(BUILD)/tfq3-metal-test" ]; then $(BUILD)/tfq3-metal-test; fi
 	@if [ "$(UNAME_S)" = "Darwin" ] && [ -x "$(BUILD)/tfq4-metal-test" ]; then $(BUILD)/tfq4-metal-test; fi
 	@if [ "$(UNAME_S)" != "Darwin" ] && [ -x "$(BUILD)/tfq3-cuda-test" ]; then $(BUILD)/tfq3-cuda-test; fi
@@ -175,10 +189,10 @@ install: all
 	@install -m 0755 $(BUILD)/tfq3-inspect $(BUILD)/tfq3-qwen27-package "$(LIBDIR)/"
 	@install -m 0644 src/converters/flashnext/package.py "$(LIBDIR)/flashnext_package.py"
 ifeq ($(UNAME_S),Darwin)
-	@install -m 0755 $(BUILD)/tfq3-generic-convert $(BUILD)/tfq3-qwen27-convert $(BUILD)/tfq3-flashnext-convert $(BUILD)/tfq3-glm-convert $(BUILD)/tfq4-convert "$(LIBDIR)/"
-	@install -m 0644 $(BUILD)/tfq3-generic-convert.metallib $(BUILD)/tfq3-qwen27-convert.metallib $(BUILD)/tfq3-flashnext-convert.metallib $(BUILD)/tfq3-glm-convert.metallib $(BUILD)/tfq4-convert.metallib "$(LIBDIR)/"
+	@install -m 0755 $(BUILD)/tfq3-generic-convert $(BUILD)/tfq3-qwen27-convert $(BUILD)/tfq3-flashnext-convert $(BUILD)/tfq3-glm-convert $(BUILD)/tfq3-inkling2-convert $(BUILD)/tfq4-convert "$(LIBDIR)/"
+	@install -m 0644 $(BUILD)/tfq3-generic-convert.metallib $(BUILD)/tfq3-qwen27-convert.metallib $(BUILD)/tfq3-flashnext-convert.metallib $(BUILD)/tfq3-glm-convert.metallib $(BUILD)/tfq3-inkling2-convert.metallib $(BUILD)/tfq4-convert.metallib "$(LIBDIR)/"
 else
-	@install -m 0755 $(BUILD)/tfq3-generic-convert-cuda $(BUILD)/tfq3-qwen27-convert-cuda $(BUILD)/tfq3-flashnext-convert-cuda $(BUILD)/tfq3-glm-convert-cuda $(BUILD)/tfq3-ernie-convert-cuda $(BUILD)/tfq4-convert-cuda $(BUILD)/tfq3-cuda-test "$(LIBDIR)/"
+	@install -m 0755 $(BUILD)/tfq3-generic-convert-cuda $(BUILD)/tfq3-qwen27-convert-cuda $(BUILD)/tfq3-flashnext-convert-cuda $(BUILD)/tfq3-glm-convert-cuda $(BUILD)/tfq3-inkling2-convert-cuda $(BUILD)/tfq3-ernie-convert-cuda $(BUILD)/tfq4-convert-cuda $(BUILD)/tfq3-cuda-test "$(LIBDIR)/"
 endif
 	@echo "Installed tfq3 -> $(BINDIR)/tfq3 (runtime binaries in $(LIBDIR))"
 

@@ -16,7 +16,7 @@ Usage:
 
 Options:
   -o, --out DIR              Output directory (default: <model>-TFQ3, or <model>-TFQ4 for --bits 2)
-  --family NAME              auto | generic | qwen27 | flashnext | glm | ernie (default: auto)
+  --family NAME              auto | generic | qwen27 | flashnext | glm | inkling2 | ernie (default: auto)
   --profile PROFILE          Bit profile: 4b | 3.5b | 3b | 5b (default: 4b; ERNIE: 3b | 4b | 5b)
   --bits N                   Uniform bit width for generic converter: 2 (TFQ4-E8P) | 3 | 4 | 5
   --target-gib GB            Fit total checkpoint into GB via data-free sensitivity allocation
@@ -30,6 +30,7 @@ Options:
   --max-shard-gib GB         Max TFQ4 shard size in GiB (default: 3.4)
   --trace FILE               Optional trace-guided HeatAlloc routing counts (uses calibration counts)
   --glm-mode MODE            GLM deep-layer MoE bit mode: heat43 (3.33 bpw) | uniform4 (4.00 bpw)
+  --inkling2-mode MODE       Inkling-2 MoE bit mode: uniform3 | heat43 | heat443 | heat543 | uniform4
   --keep-nonmoe-bf16         GLM: skip nonmoe.tffpw quantization so attention/shared/head stay full-precision
   --nonmoe-model DIR         Optional 8-bit source for GLM nonmoe.tffpw
   --skip-existing            Resume MoE conversion, skipping finished shards
@@ -221,6 +222,8 @@ elif mt == "qwen4_exp":
     family = "flashnext"
 elif mt in ("glm5_next", "glm_moe_dsa"):
     family = "glm"
+elif mt == "inkling2":
+    family = "inkling2"
 elif mt == "ernie5_5_moe":
     family = "ernie"
 nl = tc.get("num_hidden_layers") or cfg.get("num_hidden_layers") or 0
@@ -263,7 +266,7 @@ run_doctor() {
         fi
     fi
     echo "lib_dir:  ${lib_dir}"
-    local bins=("tfq3-generic-convert${suffix}" "tfq4-convert${suffix}" "tfq3-qwen27-convert${suffix}" "tfq3-qwen27-package" "tfq3-flashnext-convert${suffix}" "tfq3-glm-convert${suffix}")
+    local bins=("tfq3-generic-convert${suffix}" "tfq4-convert${suffix}" "tfq3-qwen27-convert${suffix}" "tfq3-qwen27-package" "tfq3-flashnext-convert${suffix}" "tfq3-glm-convert${suffix}" "tfq3-inkling2-convert${suffix}")
     [ "$(uname -s)" = "Darwin" ] || bins+=("tfq3-ernie-convert-cuda")  # CUDA only, no Metal build
     bins+=("tfq3-inspect")
     for b in "${bins[@]}"; do
@@ -314,6 +317,7 @@ run_convert() {
     local max_shard_gib=""
     local trace_file=""
     local glm_mode="heat43"
+    local inkling2_mode=""
     local keep_nonmoe_bf16=0
     local nonmoe_model=""
     local skip_existing=0
@@ -338,6 +342,7 @@ run_convert() {
             --max-shard-gib) [ $# -ge 2 ] || die "--max-shard-gib requires GB"; max_shard_gib="$2"; shift 2 ;;
             --trace) [ $# -ge 2 ] || die "--trace requires a file path"; trace_file="$2"; shift 2 ;;
             --glm-mode) [ $# -ge 2 ] || die "--glm-mode requires heat43|uniform4"; glm_mode="$2"; shift 2 ;;
+            --inkling2-mode) [ $# -ge 2 ] || die "--inkling2-mode requires uniform3|heat43|heat443|heat543|uniform4"; inkling2_mode="$2"; shift 2 ;;
             --keep-nonmoe-bf16) keep_nonmoe_bf16=1; shift ;;
             --nonmoe-model) [ $# -ge 2 ] || die "--nonmoe-model requires a directory"; nonmoe_model="$2"; shift 2 ;;
             --skip-existing) skip_existing=1; shift ;;
@@ -553,6 +558,28 @@ run_convert() {
             fi
             run_cmd "$inspect_bin" "$out_dir"
             ;;
+        inkling2)
+            if [ -z "$inkling2_mode" ]; then
+                case "$profile" in
+                    4b)   inkling2_mode="uniform4" ;;
+                    3.5b) inkling2_mode="heat43" ;;
+                    3b)   inkling2_mode="uniform3" ;;
+                    *)    die "invalid --profile '${profile}' for Inkling-2 (expected 4b, 3.5b, or 3b, or pass --inkling2-mode)" ;;
+                esac
+            fi
+            case "$inkling2_mode" in uniform4|heat543|heat443|heat43|uniform3) ;; *) die "invalid --inkling2-mode '${inkling2_mode}'" ;; esac
+            local conv_bin
+            conv_bin="$(require_tool "$lib_dir" "tfq3-inkling2-convert${suffix}")"
+            local extra_flags=()
+            [ -n "$trace_file" ] && extra_flags+=(--trace "$trace_file")
+            [ "$skip_existing" -eq 1 ] && extra_flags+=(--skip-existing)
+            echo "  inkling2_mode: ${inkling2_mode}"
+            echo ""
+            echo "=== [1/2] Quantizing Inkling-2 MoE layers (NVFP4 + MXFP8 -> TFPW v3) & exporting BF16 residuals ==="
+            run_cmd "$conv_bin" --model "$src_dir" --out "$out_dir" --mode "$inkling2_mode" --copy-residuals ${extra_flags[@]+"${extra_flags[@]}"}
+            echo "=== [2/2] Validating TFQ3 output ==="
+            run_cmd "$inspect_bin" "$out_dir"
+            ;;
         ernie)
             [ "$(uname -s)" != "Darwin" ] || die "the ERNIE converter is CUDA-only (there is no Metal build)"
             [ "$fmt_kind" != "fp8" ] || die "ERNIE needs the BF16 checkpoint (e.g. baidu/ERNIE-5.5-Flash-Preview-BF16); ${src_dir} is quantized"
@@ -571,7 +598,7 @@ run_convert() {
             run_cmd "$inspect_bin" "$out_dir"
             ;;
         *)
-            die "unknown family '${family}' (expected auto, generic, qwen27, flashnext, glm, or ernie)"
+            die "unknown family '${family}' (expected auto, generic, qwen27, flashnext, glm, inkling2, or ernie)"
             ;;
     esac
 
