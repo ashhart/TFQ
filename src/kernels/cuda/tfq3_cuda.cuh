@@ -142,6 +142,18 @@ __device__ __forceinline__ float pw_glu(float g, float u, float lim, uint32_t ac
     return __bfloat162float(__float2bfloat16(sg * uv));
 }
 
+// Inkling-2 tanh-softcapped SwiGLU: exact match to TensorFold's tf_tfq3_moe_gu_softcap.
+// When gate_cap > 0: gc = gate_cap * tanh(raw / gate_cap); when up_cap > 0: uc = up_cap * tanh(uv / up_cap);
+// sigmoid uses the BF16-rounded gate `raw`, and output is BF16-rounded `(gc * sigmoid) * uc`.
+__device__ __forceinline__ float pw_glu_softcap(float g, float u, float gate_cap, float up_cap) {
+    const float raw = __bfloat162float(__float2bfloat16_rn(g));
+    const float uv  = __bfloat162float(__float2bfloat16_rn(u));
+    const float gc  = (gate_cap > 0.0f) ? (gate_cap * tanhf(raw / gate_cap)) : raw;
+    const float uc  = (up_cap   > 0.0f) ? (up_cap   * tanhf(uv  / up_cap))   : uv;
+    const float sigmoid = 1.0f / (1.0f + expf(-raw));
+    return __bfloat162float(__float2bfloat16_rn((gc * sigmoid) * uc));
+}
+
 // ----------------------------------------------------------------------------
 // 1. Input & Output FWHT-128 Kernels
 // ----------------------------------------------------------------------------
@@ -152,22 +164,23 @@ __global__ void tfq3_fwht_x_kernel(
     uint32_t k_sign_off = 0u
 ) {
     const uint32_t lane = threadIdx.x;
-    const uint32_t row = blockIdx.y;
     const uint32_t c0 = blockIdx.x * 128u;
+    if (c0 >= d.k) return;
     const uint32_t cs = c0 + k_sign_off;
-    if (row >= d.rows || c0 >= d.k) return;
-    const uint16_t* src = X + static_cast<uint64_t>(row) * d.ldx + c0;
-    float4 v;
-    v.x = bf16_to_f32(src[lane +  0u]) * pw_sgn(0x12345678u, cs + lane +  0u);
-    v.y = bf16_to_f32(src[lane + 32u]) * pw_sgn(0x12345678u, cs + lane + 32u);
-    v.z = bf16_to_f32(src[lane + 64u]) * pw_sgn(0x12345678u, cs + lane + 64u);
-    v.w = bf16_to_f32(src[lane + 96u]) * pw_sgn(0x12345678u, cs + lane + 96u);
-    pw_fwht128_simd4(v, lane);
-    __half* dst = X_rot + static_cast<uint64_t>(row) * d.k + c0;
-    dst[lane +  0u] = tfq3_float2half_sat(v.x);
-    dst[lane + 32u] = tfq3_float2half_sat(v.y);
-    dst[lane + 64u] = tfq3_float2half_sat(v.z);
-    dst[lane + 96u] = tfq3_float2half_sat(v.w);
+    for (uint32_t row = blockIdx.y; row < d.rows; row += gridDim.y) {
+        const uint16_t* src = X + static_cast<uint64_t>(row) * d.ldx + c0;
+        float4 v;
+        v.x = bf16_to_f32(src[lane +  0u]) * pw_sgn(0x12345678u, cs + lane +  0u);
+        v.y = bf16_to_f32(src[lane + 32u]) * pw_sgn(0x12345678u, cs + lane + 32u);
+        v.z = bf16_to_f32(src[lane + 64u]) * pw_sgn(0x12345678u, cs + lane + 64u);
+        v.w = bf16_to_f32(src[lane + 96u]) * pw_sgn(0x12345678u, cs + lane + 96u);
+        pw_fwht128_simd4(v, lane);
+        __half* dst = X_rot + static_cast<uint64_t>(row) * d.k + c0;
+        dst[lane +  0u] = tfq3_float2half_sat(v.x);
+        dst[lane + 32u] = tfq3_float2half_sat(v.y);
+        dst[lane + 64u] = tfq3_float2half_sat(v.z);
+        dst[lane + 96u] = tfq3_float2half_sat(v.w);
+    }
 }
 
 __global__ void tfq3_fwht_y_kernel(
@@ -177,25 +190,26 @@ __global__ void tfq3_fwht_y_kernel(
     uint32_t out_f32
 ) {
     const uint32_t lane = threadIdx.x;
-    const uint32_t row = blockIdx.y;
     const uint32_t r0 = blockIdx.x * 128u;
-    if (row >= d.rows || r0 >= d.n) return;
-    float4 v = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    if (r0 >= d.n) return;
     const uint32_t ks = d.ksplit > 1u ? d.ksplit : 1u;
-    for (uint32_t kp = 0u; kp < ks; ++kp) {
-        const float* src = YR + (static_cast<uint64_t>(kp) * d.rows + row) * d.n + r0;
-        v.x += src[lane +  0u];
-        v.y += src[lane + 32u];
-        v.z += src[lane + 64u];
-        v.w += src[lane + 96u];
-    }
-    pw_fwht128_simd4(v, lane);
     const uint32_t sr0 = pw_sr0(r0 + d.row_off, d.sr_split);
-    const uint64_t base = static_cast<uint64_t>(row) * d.ldo + r0;
-    pw_store(OUT, base + lane +  0u, v.x * pw_sgn(0x9E3779B9u, sr0 + lane +  0u), out_f32);
-    pw_store(OUT, base + lane + 32u, v.y * pw_sgn(0x9E3779B9u, sr0 + lane + 32u), out_f32);
-    pw_store(OUT, base + lane + 64u, v.z * pw_sgn(0x9E3779B9u, sr0 + lane + 64u), out_f32);
-    pw_store(OUT, base + lane + 96u, v.w * pw_sgn(0x9E3779B9u, sr0 + lane + 96u), out_f32);
+    for (uint32_t row = blockIdx.y; row < d.rows; row += gridDim.y) {
+        float4 v = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        for (uint32_t kp = 0u; kp < ks; ++kp) {
+            const float* src = YR + (static_cast<uint64_t>(kp) * d.rows + row) * d.n + r0;
+            v.x += src[lane +  0u];
+            v.y += src[lane + 32u];
+            v.z += src[lane + 64u];
+            v.w += src[lane + 96u];
+        }
+        pw_fwht128_simd4(v, lane);
+        const uint64_t base = static_cast<uint64_t>(row) * d.ldo + r0;
+        pw_store(OUT, base + lane +  0u, v.x * pw_sgn(0x9E3779B9u, sr0 + lane +  0u), out_f32);
+        pw_store(OUT, base + lane + 32u, v.y * pw_sgn(0x9E3779B9u, sr0 + lane + 32u), out_f32);
+        pw_store(OUT, base + lane + 64u, v.z * pw_sgn(0x9E3779B9u, sr0 + lane + 64u), out_f32);
+        pw_store(OUT, base + lane + 96u, v.w * pw_sgn(0x9E3779B9u, sr0 + lane + 96u), out_f32);
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -286,28 +300,44 @@ __device__ __forceinline__ void pw_stage_b24(__half* dst, __half2 q0a, __half2 q
     p0[0] = q0a; p0[1] = q0b; p1[0] = q1a; p1[1] = q1b;
 }
 
-__device__ __forceinline__ void pw_mma_f16_16x16x16(
-    float (&b0)[8], const __half* __restrict__ tg_a, int kb, const __half* __restrict__ tg_b, uint32_t lane
+__device__ __forceinline__ void pw_load_b_frag(
+    const __half* __restrict__ tg_b, uint32_t lane,
+    uint32_t& b0_lo, uint32_t& b1_lo, uint32_t& b0_hi, uint32_t& b1_hi
 ) {
-    uint32_t g = lane >> 2, t = (lane & 3u) << 1;
+    const uint32_t g = lane >> 2, t = (lane & 3u) << 1;
+    const __half* b0p = tg_b + g * 24u + t;
+    const __half* b1p = b0p + 8u * 24u;
+    b0_lo = *reinterpret_cast<const uint32_t*>(b0p);
+    b1_lo = *reinterpret_cast<const uint32_t*>(b0p + 8u);
+    b0_hi = *reinterpret_cast<const uint32_t*>(b1p);
+    b1_hi = *reinterpret_cast<const uint32_t*>(b1p + 8u);
+}
+
+__device__ __forceinline__ void pw_mma_f16_16x16x16_b(
+    float (&b0)[8], const __half* __restrict__ tg_a, int kb,
+    uint32_t b0_lo, uint32_t b1_lo, uint32_t b0_hi, uint32_t b1_hi, uint32_t lane
+) {
+    const uint32_t g = lane >> 2, t = (lane & 3u) << 1;
     const __half* a0p = tg_a + g * 136u + kb * 16 + t;
     const __half* a1p = a0p + 8u * 136u;
     uint32_t a0 = *reinterpret_cast<const uint32_t*>(a0p);
     uint32_t a1 = *reinterpret_cast<const uint32_t*>(a1p);
     uint32_t a2 = *reinterpret_cast<const uint32_t*>(a0p + 8u);
     uint32_t a3 = *reinterpret_cast<const uint32_t*>(a1p + 8u);
-    const __half* b0p = tg_b + g * 24u + t;
-    const __half* b1p = b0p + 8u * 24u;
-    uint32_t b0_lo = *reinterpret_cast<const uint32_t*>(b0p);
-    uint32_t b1_lo = *reinterpret_cast<const uint32_t*>(b0p + 8u);
-    uint32_t b0_hi = *reinterpret_cast<const uint32_t*>(b1p);
-    uint32_t b1_hi = *reinterpret_cast<const uint32_t*>(b1p + 8u);
     asm volatile(
         "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%8,%9,%10,%11}, {%12,%13}, {%0,%1,%2,%3};\n"
         "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%4,%5,%6,%7}, {%8,%9,%10,%11}, {%14,%15}, {%4,%5,%6,%7};\n"
         : "+f"(b0[0]), "+f"(b0[1]), "+f"(b0[2]), "+f"(b0[3]),
           "+f"(b0[4]), "+f"(b0[5]), "+f"(b0[6]), "+f"(b0[7])
         : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0_lo), "r"(b1_lo), "r"(b0_hi), "r"(b1_hi));
+}
+
+__device__ __forceinline__ void pw_mma_f16_16x16x16(
+    float (&b0)[8], const __half* __restrict__ tg_a, int kb, const __half* __restrict__ tg_b, uint32_t lane
+) {
+    uint32_t b0_lo, b1_lo, b0_hi, b1_hi;
+    pw_load_b_frag(tg_b, lane, b0_lo, b1_lo, b0_hi, b1_hi);
+    pw_mma_f16_16x16x16_b(b0, tg_a, kb, b0_lo, b1_lo, b0_hi, b1_hi, lane);
 }
 
 template <uint32_t BITS, int MTILES>
@@ -335,10 +365,12 @@ __device__ __forceinline__ void pw_mma_bc_mt(
                 pw_v3_q8_4b(st, uv[j], T, q0a, q0b, q1a, q1b);
                 pw_stage_b24(tg_b_warp, q0a, q0b, q1a, q1b, home);
                 __syncwarp();
+                uint32_t b0_lo, b1_lo, b0_hi, b1_hi;
+                pw_load_b_frag(tg_b_warp, lane, b0_lo, b1_lo, b0_hi, b1_hi);
                 #pragma unroll
                 for (int ms = 0; ms < MTILES; ++ms) {
                     if (static_cast<uint32_t>(ms) * 16u < nb) {
-                        pw_mma_f16_16x16x16(b0[ms], tg_a + static_cast<uint32_t>(ms) * 16u * 136u, kb + j, tg_b_warp, lane);
+                        pw_mma_f16_16x16x16_b(b0[ms], tg_a + static_cast<uint32_t>(ms) * 16u * 136u, kb + j, b0_lo, b1_lo, b0_hi, b1_hi, lane);
                     }
                 }
             }
@@ -354,10 +386,12 @@ __device__ __forceinline__ void pw_mma_bc_mt(
                 pw_v3_q8_3b(st, mv[j], T, q0a, q0b, q1a, q1b);
                 pw_stage_b24(tg_b_warp, q0a, q0b, q1a, q1b, home);
                 __syncwarp();
+                uint32_t b0_lo, b1_lo, b0_hi, b1_hi;
+                pw_load_b_frag(tg_b_warp, lane, b0_lo, b1_lo, b0_hi, b1_hi);
                 #pragma unroll
                 for (int ms = 0; ms < MTILES; ++ms) {
                     if (static_cast<uint32_t>(ms) * 16u < nb) {
-                        pw_mma_f16_16x16x16(b0[ms], tg_a + static_cast<uint32_t>(ms) * 16u * 136u, kb + j, tg_b_warp, lane);
+                        pw_mma_f16_16x16x16_b(b0[ms], tg_a + static_cast<uint32_t>(ms) * 16u * 136u, kb + j, b0_lo, b1_lo, b0_hi, b1_hi, lane);
                     }
                 }
             }
@@ -374,10 +408,12 @@ __device__ __forceinline__ void pw_mma_bc_mt(
                 pw_v3_q8_5b(st, hv[j], lv[j], T, q0a, q0b, q1a, q1b);
                 pw_stage_b24(tg_b_warp, q0a, q0b, q1a, q1b, home);
                 __syncwarp();
+                uint32_t b0_lo, b1_lo, b0_hi, b1_hi;
+                pw_load_b_frag(tg_b_warp, lane, b0_lo, b1_lo, b0_hi, b1_hi);
                 #pragma unroll
                 for (int ms = 0; ms < MTILES; ++ms) {
                     if (static_cast<uint32_t>(ms) * 16u < nb) {
-                        pw_mma_f16_16x16x16(b0[ms], tg_a + static_cast<uint32_t>(ms) * 16u * 136u, kb + j, tg_b_warp, lane);
+                        pw_mma_f16_16x16x16_b(b0[ms], tg_a + static_cast<uint32_t>(ms) * 16u * 136u, kb + j, b0_lo, b1_lo, b0_hi, b1_hi, lane);
                     }
                 }
             }
@@ -528,7 +564,7 @@ __global__ __launch_bounds__(256, (MTILES == 1) ? 4 : ((MTILES == 2) ? 3 : 2)) v
 // High-throughput Long-Context Prefill & Zero-Repack Tensor-Parallel Kernel (BM=64, BN=128, 4x weight reuse):
 // grid=(N_local/128, ceil(rows/64)), block=256. Supports arbitrary Row-TP (bc0..bc1) and Col-TP (strip_off/sc_row_off).
 template <uint32_t BITS>
-__global__ void tfq3_mma_prefill_tp_kernel(
+__global__ __launch_bounds__(256, 2) void tfq3_mma_prefill_tp_kernel(
     const uint32_t* __restrict__ W,
     const __half* __restrict__ scales,
     const PwV3Tables* __restrict__ T,
@@ -570,73 +606,7 @@ __global__ void tfq3_mma_prefill_tp_kernel(
             *reinterpret_cast<uint4*>(sm.ab.a + rl * 136u + cl) = v;
         }
         __syncthreads();
-
-        float b0[4][8];
-        #pragma unroll
-        for (int ms = 0; ms < 4; ++ms) {
-            #pragma unroll
-            for (int i = 0; i < 8; ++i) b0[ms][i] = 0.0f;
-        }
-        __half2 q0a, q0b, q1a, q1b;
-        if constexpr (BITS == 4u) {
-            const uint4* p = reinterpret_cast<const uint4*>(w_s + static_cast<uint64_t>(bc) * 8ull * 32ull);
-            for (uint32_t h = 0u; h < 2u; ++h) {
-                uint4 v = __ldg(&p[h * 32u + lane]);
-                uint32_t uv[4] = {v.x, v.y, v.z, v.w};
-                int kb = static_cast<int>(h * 4u);
-                #pragma unroll
-                for (int j = 0; j < 4; ++j) {
-                    pw_v3_q8_4b(st, uv[j], T, q0a, q0b, q1a, q1b);
-                    pw_stage_b24(sm.ab.b[sg], q0a, q0b, q1a, q1b, home);
-                    __syncwarp();
-                    #pragma unroll
-                    for (int ms = 0; ms < 4; ++ms) {
-                        if (ms * 16u < nb) pw_mma_f16_16x16x16(b0[ms], sm.ab.a + ms * 16u * 136u, kb + j, sm.ab.b[sg], lane);
-                    }
-                }
-            }
-        } else if constexpr (BITS == 3u) {
-            for (uint32_t h = 0u; h < 2u; ++h) {
-                const uint32_t* p = w_s + (static_cast<uint64_t>(bc) * 6ull + h * 3ull) * 32ull + lane;
-                uint32_t a0 = __ldg(&p[0]), a1 = __ldg(&p[32]), a2 = __ldg(&p[64]);
-                uint32_t mv[4] = {a0 >> 8, ((a0 << 16) | (a1 >> 16)) & 0xFFFFFFu, ((a1 << 8) | (a2 >> 24)) & 0xFFFFFFu, a2 & 0xFFFFFFu};
-                int kb = static_cast<int>(h * 4u);
-                #pragma unroll
-                for (int j = 0; j < 4; ++j) {
-                    pw_v3_q8_3b(st, mv[j], T, q0a, q0b, q1a, q1b);
-                    pw_stage_b24(sm.ab.b[sg], q0a, q0b, q1a, q1b, home);
-                    __syncwarp();
-                    #pragma unroll
-                    for (int ms = 0; ms < 4; ++ms) {
-                        if (ms * 16u < nb) pw_mma_f16_16x16x16(b0[ms], sm.ab.a + ms * 16u * 136u, kb + j, sm.ab.b[sg], lane);
-                    }
-                }
-            }
-        } else {
-            for (uint32_t h = 0u; h < 2u; ++h) {
-                const uint32_t* p = w_s + (static_cast<uint64_t>(bc) * 10ull + h * 5ull) * 32ull + lane;
-                uint32_t w0 = __ldg(&p[0]), w1 = __ldg(&p[32]), w2 = __ldg(&p[64]), w3 = __ldg(&p[96]), w4 = __ldg(&p[128]);
-                uint32_t hv[4] = {w0 >> 24, (w1 >> 16) & 255u, (w2 >> 8) & 255u, w3 & 255u};
-                uint32_t lv[4] = {(w0 << 8) | (w1 >> 24), (w1 << 16) | (w2 >> 16), (w2 << 24) | (w3 >> 8), w4};
-                int kb = static_cast<int>(h * 4u);
-                #pragma unroll
-                for (int j = 0; j < 4; ++j) {
-                    pw_v3_q8_5b(st, hv[j], lv[j], T, q0a, q0b, q1a, q1b);
-                    pw_stage_b24(sm.ab.b[sg], q0a, q0b, q1a, q1b, home);
-                    __syncwarp();
-                    #pragma unroll
-                    for (int ms = 0; ms < 4; ++ms) {
-                        if (ms * 16u < nb) pw_mma_f16_16x16x16(b0[ms], sm.ab.a + ms * 16u * 136u, kb + j, sm.ab.b[sg], lane);
-                    }
-                }
-            }
-        }
-        float fsv = __half2float(__ldg(&sc0[bc]));
-        #pragma unroll
-        for (int ms = 0; ms < 4; ++ms) {
-            #pragma unroll
-            for (int i = 0; i < 8; ++i) acc[ms][i] = fmaf(b0[ms][i], fsv, acc[ms][i]);
-        }
+        pw_mma_bc_mt<BITS, 4>(w_s, sc0, bc, T, st, lane, home, sm.ab.a, sm.ab.b[sg], nb, acc);
         __syncthreads();
     }
 
@@ -786,6 +756,61 @@ __global__ void tfq3_moe_gu_swiglu_kernel(
         z.y = pw_glu(gv.y * pw_sgn(0x9E3779B9u, r0 + lane + 32u), uv.y * pw_sgn(0x9E3779B9u, r0 + lane + 32u), lim, act_mode) * pw_sgn(0x12345678u, r0 + lane + 32u);
         z.z = pw_glu(gv.z * pw_sgn(0x9E3779B9u, r0 + lane + 64u), uv.z * pw_sgn(0x9E3779B9u, r0 + lane + 64u), lim, act_mode) * pw_sgn(0x12345678u, r0 + lane + 64u);
         z.w = pw_glu(gv.w * pw_sgn(0x9E3779B9u, r0 + lane + 96u), uv.w * pw_sgn(0x9E3779B9u, r0 + lane + 96u), lim, act_mode) * pw_sgn(0x12345678u, r0 + lane + 96u);
+        pw_fwht128_simd4(z, lane);
+        __half* dst = act_rot + static_cast<uint64_t>(slot_flat) * inter + r0;
+        dst[lane +  0u] = tfq3_float2half_sat(z.x);
+        dst[lane + 32u] = tfq3_float2half_sat(z.y);
+        dst[lane + 64u] = tfq3_float2half_sat(z.z);
+        dst[lane + 96u] = tfq3_float2half_sat(z.w);
+    }
+}
+
+// Fused MoE gate+up -> inv-FWHT-128 -> Inkling-2 tanh-softcapped SwiGLU -> fwd-FWHT-128 -> act_rot[slot_flat, inter].
+__global__ void tfq3_moe_gu_softcap_kernel(
+    const uint32_t* __restrict__ W,
+    const __half* __restrict__ scales,
+    const TfpwExpertMeta* __restrict__ metas,
+    const PwV3Tables* __restrict__ T,
+    const __half* __restrict__ X_rot,
+    const int32_t* __restrict__ picks,
+    __half* __restrict__ act_rot,
+    uint32_t dims, uint32_t inter, uint32_t experts,
+    uint32_t top_k, uint32_t pick_stride, float gate_cap, float up_cap
+) {
+    const uint32_t br = blockIdx.x, slot_flat = blockIdx.y;
+    const uint32_t row = slot_flat / top_k, s = slot_flat - row * top_k;
+    const int32_t eid = picks[static_cast<uint64_t>(row) * pick_stride + s];
+    if (eid < 0 || static_cast<uint32_t>(eid) >= experts) return;
+    const TfpwExpertMeta em = metas[eid];
+    const uint32_t bits = em.b_bits, wpb = bits * 2u, n_bc = dims >> 7;
+    const uint32_t sg = threadIdx.x >> 5, lane = threadIdx.x & 31u;
+    const uint32_t strip = br * 8u + sg, r0 = br * 128u;
+    const int2 home = pw_frag_home(lane);
+    const __half* xr = X_rot + static_cast<uint64_t>(row) * dims;
+    const uint32_t* wg = W + em.gate_word_off + static_cast<uint64_t>(strip) * n_bc * wpb * 32ull;
+    const uint32_t* wu = W + em.up_word_off   + static_cast<uint64_t>(strip) * n_bc * wpb * 32ull;
+    const __half* sg_p = scales + em.gate_sc_off + static_cast<uint64_t>(br) * n_bc;
+    const __half* su_p = scales + em.up_sc_off   + static_cast<uint64_t>(br) * n_bc;
+    __shared__ float tg_g[128], tg_u[128];
+    float g0, g1, u0, u1;
+    pw_mv1_dispatch(bits, wg, sg_p, n_bc, T, xr, lane, home, g0, g1);
+    pw_mv1_dispatch(bits, wu, su_p, n_bc, T, xr, lane, home, u0, u1);
+    if ((lane & 9u) == 0u) {
+        uint32_t idx = sg * 16u + static_cast<uint32_t>(home.y);
+        tg_g[idx] = g0; tg_g[idx + 8u] = g1;
+        tg_u[idx] = u0; tg_u[idx + 8u] = u1;
+    }
+    __syncthreads();
+    if (sg == 0u) {
+        float4 gv = make_float4(tg_g[lane], tg_g[lane + 32u], tg_g[lane + 64u], tg_g[lane + 96u]);
+        float4 uv = make_float4(tg_u[lane], tg_u[lane + 32u], tg_u[lane + 64u], tg_u[lane + 96u]);
+        pw_fwht128_simd4(gv, lane);
+        pw_fwht128_simd4(uv, lane);
+        float4 z;
+        z.x = pw_glu_softcap(gv.x * pw_sgn(0x9E3779B9u, r0 + lane +  0u), uv.x * pw_sgn(0x9E3779B9u, r0 + lane +  0u), gate_cap, up_cap) * pw_sgn(0x12345678u, r0 + lane +  0u);
+        z.y = pw_glu_softcap(gv.y * pw_sgn(0x9E3779B9u, r0 + lane + 32u), uv.y * pw_sgn(0x9E3779B9u, r0 + lane + 32u), gate_cap, up_cap) * pw_sgn(0x12345678u, r0 + lane + 32u);
+        z.z = pw_glu_softcap(gv.z * pw_sgn(0x9E3779B9u, r0 + lane + 64u), uv.z * pw_sgn(0x9E3779B9u, r0 + lane + 64u), gate_cap, up_cap) * pw_sgn(0x12345678u, r0 + lane + 64u);
+        z.w = pw_glu_softcap(gv.w * pw_sgn(0x9E3779B9u, r0 + lane + 96u), uv.w * pw_sgn(0x9E3779B9u, r0 + lane + 96u), gate_cap, up_cap) * pw_sgn(0x12345678u, r0 + lane + 96u);
         pw_fwht128_simd4(z, lane);
         __half* dst = act_rot + static_cast<uint64_t>(slot_flat) * inter + r0;
         dst[lane +  0u] = tfq3_float2half_sat(z.x);
@@ -952,6 +977,30 @@ inline void dispatch_fused_mt(
     else tfq3_mma_fused_mt_kernel<5u, MTILES><<<g, 256, 0, stream>>>(W, scales, T, xrot_buf, Y, d, out_f32);
 }
 
+// Zero-partial fused prefill launch (`tfq3_mma_fused_mt_kernel`, BM=64/BN=128 for rows > 48,
+// zero global `yr_buf` traffic, single weight read + B-fragment register reuse across MTILES).
+inline cudaError_t launch_dense_prefill(
+    const uint32_t* W, const __half* scales, const PwV3Tables* T,
+    const uint16_t* X, void* Y,
+    __half* xrot_buf,
+    uint32_t bits, uint32_t rows, uint32_t n, uint32_t k,
+    uint32_t ldx, uint32_t ldo, uint32_t sr_split = 0u,
+    bool out_f32 = false, uint32_t row_off = 0u,
+    cudaStream_t stream = nullptr
+) {
+    if (rows == 0u || n == 0u || k == 0u) return cudaSuccess;
+    const uint32_t n_bc = k >> 7;
+    const uint32_t gy_x = (rows < 65535u) ? rows : 65535u;
+    DenseDims d{rows, n, k, ldx, ldo, sr_split, 1u, row_off};
+    tfq3_fwht_x_kernel<<<dim3(n_bc, gy_x, 1), 32, 0, stream>>>(X, xrot_buf, d);
+    const uint32_t of32 = out_f32 ? 1u : 0u;
+    if (rows <= 16u)      dispatch_fused_mt<1>(bits, dim3(n / 128u, 1u, 1u), stream, W, scales, T, xrot_buf, Y, d, of32);
+    else if (rows <= 32u) dispatch_fused_mt<2>(bits, dim3(n / 128u, 1u, 1u), stream, W, scales, T, xrot_buf, Y, d, of32);
+    else if (rows <= 48u) dispatch_fused_mt<3>(bits, dim3(n / 128u, 1u, 1u), stream, W, scales, T, xrot_buf, Y, d, of32);
+    else                  dispatch_fused_mt<4>(bits, dim3(n / 128u, (rows + 63u) / 64u, 1u), stream, W, scales, T, xrot_buf, Y, d, of32);
+    return cudaGetLastError();
+}
+
 inline cudaError_t launch_dense(
     const uint32_t* W, const __half* scales, const PwV3Tables* T,
     const uint16_t* X, void* Y,
@@ -961,25 +1010,24 @@ inline cudaError_t launch_dense(
     bool out_f32 = false, uint32_t row_off = 0u,
     cudaStream_t stream = nullptr
 ) {
+    if (rows == 0u || n == 0u || k == 0u) return cudaSuccess;
     const uint32_t n_bc = k >> 7;
     const uint32_t ks = choose_ksplit(n, k);
     const size_t req_yr = (ks > 1u) ? (static_cast<size_t>(rows) * n * ks) : 0ull;
     const bool use_sk = (rows <= 64u) && (ks > 1u) && (yr_buf != nullptr) && (max_yr_elems >= req_yr);
-    DenseDims d{rows, n, k, ldx, ldo, sr_split, use_sk ? ks : 1u, row_off};
-    tfq3_fwht_x_kernel<<<dim3(n_bc, rows, 1), 32, 0, stream>>>(X, xrot_buf, d);
-    if (use_sk) {
-        if (rows <= 16u)      dispatch_sk_mt<1>(bits, dim3(n / 64u, ks, 1u), stream, W, scales, T, xrot_buf, yr_buf, d);
-        else if (rows <= 32u) dispatch_sk_mt<2>(bits, dim3(n / 64u, ks, 1u), stream, W, scales, T, xrot_buf, yr_buf, d);
-        else if (rows <= 48u) dispatch_sk_mt<3>(bits, dim3(n / 64u, ks, 1u), stream, W, scales, T, xrot_buf, yr_buf, d);
-        else                  dispatch_sk_mt<4>(bits, dim3(n / 64u, ks, 1u), stream, W, scales, T, xrot_buf, yr_buf, d);
-        tfq3_fwht_y_kernel<<<dim3(n / 128u, rows, 1), 32, 0, stream>>>(yr_buf, Y, d, out_f32 ? 1u : 0u);
-    } else {
-        const uint32_t of32 = out_f32 ? 1u : 0u;
-        if (rows <= 16u)      dispatch_fused_mt<1>(bits, dim3(n / 128u, 1u, 1u), stream, W, scales, T, xrot_buf, Y, d, of32);
-        else if (rows <= 32u) dispatch_fused_mt<2>(bits, dim3(n / 128u, 1u, 1u), stream, W, scales, T, xrot_buf, Y, d, of32);
-        else if (rows <= 48u) dispatch_fused_mt<3>(bits, dim3(n / 128u, 1u, 1u), stream, W, scales, T, xrot_buf, Y, d, of32);
-        else                  dispatch_fused_mt<4>(bits, dim3(n / 128u, (rows + 63u) / 64u, 1u), stream, W, scales, T, xrot_buf, Y, d, of32);
+    if (!use_sk) {
+        return launch_dense_prefill(
+            W, scales, T, X, Y, xrot_buf, bits, rows, n, k, ldx, ldo, sr_split, out_f32, row_off, stream
+        );
     }
+    const uint32_t gy_x = (rows < 65535u) ? rows : 65535u;
+    DenseDims d{rows, n, k, ldx, ldo, sr_split, ks, row_off};
+    tfq3_fwht_x_kernel<<<dim3(n_bc, gy_x, 1), 32, 0, stream>>>(X, xrot_buf, d);
+    if (rows <= 16u)      dispatch_sk_mt<1>(bits, dim3(n / 64u, ks, 1u), stream, W, scales, T, xrot_buf, yr_buf, d);
+    else if (rows <= 32u) dispatch_sk_mt<2>(bits, dim3(n / 64u, ks, 1u), stream, W, scales, T, xrot_buf, yr_buf, d);
+    else if (rows <= 48u) dispatch_sk_mt<3>(bits, dim3(n / 64u, ks, 1u), stream, W, scales, T, xrot_buf, yr_buf, d);
+    else                  dispatch_sk_mt<4>(bits, dim3(n / 64u, ks, 1u), stream, W, scales, T, xrot_buf, yr_buf, d);
+    tfq3_fwht_y_kernel<<<dim3(n / 128u, gy_x, 1), 32, 0, stream>>>(yr_buf, Y, d, out_f32 ? 1u : 0u);
     return cudaGetLastError();
 }
 
@@ -994,10 +1042,12 @@ inline cudaError_t launch_dense_tp(
     uint32_t ldx_local, uint32_t ldo_local,
     bool out_f32 = false, cudaStream_t stream = nullptr
 ) {
+    if (rows == 0u || n_local == 0u || k_local == 0u) return cudaSuccess;
     DenseDims d{rows, n_local, k_local, ldx_local, ldo_local, 0u, 1u, n_off};
     TpRange tp{n_off >> 4, n_off >> 7, k_off >> 7, (k_off + k_local) >> 7, k_full >> 7};
     (void)n_full;
-    tfq3_fwht_x_kernel<<<dim3(k_local >> 7, rows, 1), 32, 0, stream>>>(X_local, xrot_buf, d, k_off);
+    const uint32_t gy_x = (rows < 65535u) ? rows : 65535u;
+    tfq3_fwht_x_kernel<<<dim3(k_local >> 7, gy_x, 1), 32, 0, stream>>>(X_local, xrot_buf, d, k_off);
     dim3 g(n_local >> 7, (rows + 63u) / 64u, 1u);
     if (bits == 3u) tfq3_mma_prefill_tp_kernel<3u><<<g, 256, 0, stream>>>(W, scales, T, xrot_buf, Y_local, d, tp, out_f32 ? 1u : 0u);
     else if (bits == 4u) tfq3_mma_prefill_tp_kernel<4u><<<g, 256, 0, stream>>>(W, scales, T, xrot_buf, Y_local, d, tp, out_f32 ? 1u : 0u);
@@ -1018,9 +1068,11 @@ inline cudaError_t launch_dense_tp_sliced(
     uint32_t ldx_local, uint32_t ldo_local,
     bool out_f32 = false, cudaStream_t stream = nullptr
 ) {
+    if (rows == 0u || n_local == 0u || k_local == 0u) return cudaSuccess;
     DenseDims d{rows, n_local, k_local, ldx_local, ldo_local, 0u, 1u, row_off};
     TpRange tp{0u, 0u, bc0_buf, bc0_buf + (k_local >> 7), n_bc_buf};
-    tfq3_fwht_x_kernel<<<dim3(k_local >> 7, rows, 1), 32, 0, stream>>>(X_local, xrot_buf, d, k_sign_off);
+    const uint32_t gy_x = (rows < 65535u) ? rows : 65535u;
+    tfq3_fwht_x_kernel<<<dim3(k_local >> 7, gy_x, 1), 32, 0, stream>>>(X_local, xrot_buf, d, k_sign_off);
     dim3 g(n_local >> 7, (rows + 63u) / 64u, 1u);
     if (bits == 3u) tfq3_mma_prefill_tp_kernel<3u><<<g, 256, 0, stream>>>(W_local, scales_local, T, xrot_buf, Y_local, d, tp, out_f32 ? 1u : 0u);
     else if (bits == 4u) tfq3_mma_prefill_tp_kernel<4u><<<g, 256, 0, stream>>>(W_local, scales_local, T, xrot_buf, Y_local, d, tp, out_f32 ? 1u : 0u);
@@ -1037,10 +1089,32 @@ inline cudaError_t launch_moe(
     float lim = 0.0f, uint32_t act_mode = 0u, bool out_f32 = false,
     cudaStream_t stream = nullptr
 ) {
+    if (rows == 0u || top_k == 0u || dims == 0u || inter == 0u) return cudaSuccess;
+    const uint32_t gy_x = (rows < 65535u) ? rows : 65535u;
     DenseDims dx{rows, dims, dims, x_stride, dims, 0u, 1u, 0u};
-    tfq3_fwht_x_kernel<<<dim3(dims >> 7, rows, 1), 32, 0, stream>>>(X, xrot_buf, dx);
+    tfq3_fwht_x_kernel<<<dim3(dims >> 7, gy_x, 1), 32, 0, stream>>>(X, xrot_buf, dx);
     tfq3_moe_gu_swiglu_kernel<<<dim3(inter >> 7, rows * top_k, 1), 256, 0, stream>>>(
         W, scales, metas, T, xrot_buf, picks, act_rot_buf, dims, inter, experts, top_k, pick_stride, lim, act_mode);
+    tfq3_moe_down_kernel<<<dim3(dims >> 7, rows * top_k, 1), 256, 0, stream>>>(
+        W, scales, metas, T, act_rot_buf, picks, ey, dims, inter, experts, top_k, pick_stride, out_slot_stride, out_f32 ? 1u : 0u);
+    return cudaGetLastError();
+}
+
+inline cudaError_t launch_moe_softcap(
+    const uint32_t* W, const __half* scales, const TfpwExpertMeta* metas, const PwV3Tables* T,
+    const uint16_t* X, const int32_t* picks, void* ey,
+    __half* xrot_buf, __half* act_rot_buf,
+    uint32_t rows, uint32_t dims, uint32_t inter, uint32_t experts,
+    uint32_t top_k, uint32_t x_stride, uint32_t pick_stride, uint32_t out_slot_stride,
+    float gate_cap, float up_cap, bool out_f32 = false,
+    cudaStream_t stream = nullptr
+) {
+    if (rows == 0u || top_k == 0u || dims == 0u || inter == 0u) return cudaSuccess;
+    const uint32_t gy_x = (rows < 65535u) ? rows : 65535u;
+    DenseDims dx{rows, dims, dims, x_stride, dims, 0u, 1u, 0u};
+    tfq3_fwht_x_kernel<<<dim3(dims >> 7, gy_x, 1), 32, 0, stream>>>(X, xrot_buf, dx);
+    tfq3_moe_gu_softcap_kernel<<<dim3(inter >> 7, rows * top_k, 1), 256, 0, stream>>>(
+        W, scales, metas, T, xrot_buf, picks, act_rot_buf, dims, inter, experts, top_k, pick_stride, gate_cap, up_cap);
     tfq3_moe_down_kernel<<<dim3(dims >> 7, rows * top_k, 1), 256, 0, stream>>>(
         W, scales, metas, T, act_rot_buf, picks, ey, dims, inter, experts, top_k, pick_stride, out_slot_stride, out_f32 ? 1u : 0u);
     return cudaGetLastError();

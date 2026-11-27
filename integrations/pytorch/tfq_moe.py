@@ -40,6 +40,14 @@ if _REF_DIR not in sys.path:
 
 import tfq3_reference as tfq3_ref
 
+try:
+    from . import tfq_torch as _tfq_torch  # type: ignore
+except ImportError:
+    _PT_DIR = os.path.dirname(os.path.abspath(__file__))
+    if _PT_DIR not in sys.path:
+        sys.path.insert(0, _PT_DIR)
+    import tfq_torch as _tfq_torch  # type: ignore
+
 ALIGN_16K = 16384
 TFPW_HEADER_BYTES = 144
 TFPW_EXPERT_META_BYTES = 64
@@ -48,6 +56,71 @@ TFPN_TENSOR_META_BYTES = 128
 PWV3_MIN_BYTES = 10816
 
 _LAYER_FILE_RE = re.compile(r"^layer_(\d+)\.tffpw$")
+
+
+def _get_cuda_ext():
+    return _tfq_torch._get_cuda_ext()
+
+
+def _get_mps_mod():
+    return _tfq_torch._get_mps_mod()
+
+
+def _bits_to_bpw(bits: int) -> float:
+    return 2.25 if bits == 225 else float(bits)
+
+
+def _pack_pwv3_tables_bytes(tbl: dict[str, Any]) -> bytes:
+    raw = tbl.get("_raw_bytes")
+    if isinstance(raw, (bytes, bytearray)) and len(raw) >= PWV3_MIN_BYTES:
+        return bytes(raw)
+    buf = bytearray(16384)
+    struct.pack_into(
+        "<II6f",
+        buf,
+        0,
+        tfq3_ref.MAGIC_PWV3,
+        tfq3_ref.FORMAT_VER,
+        float(tbl["a"][3]),
+        float(tbl["b"][3]),
+        float(tbl["a"][4]),
+        float(tbl["b"][4]),
+        float(tbl["a"][5]),
+        float(tbl["b"][5]),
+    )
+    buf[64 : 64 + 256 * 4] = np.ascontiguousarray(tbl["lut"][3], dtype=np.float16).tobytes()
+    buf[1088 : 1088 + 1024 * 4] = np.ascontiguousarray(tbl["lut"][4], dtype=np.float16).tobytes()
+    buf[5184 : 5184 + 1024 * 4] = np.ascontiguousarray(tbl["lut"][5], dtype=np.float16).tobytes()
+    buf[9280 : 9280 + 64 * 8] = np.ascontiguousarray(tbl["c64"][3], dtype=np.float16).tobytes()
+    buf[9792 : 9792 + 64 * 8] = np.ascontiguousarray(tbl["c64"][4], dtype=np.float16).tobytes()
+    buf[10304 : 10304 + 64 * 8] = np.ascontiguousarray(tbl["c64"][5], dtype=np.float16).tobytes()
+    return bytes(buf)
+
+
+def load_and_validate_pwv4_tables(tables_path: str | os.PathLike[str]) -> tuple[np.ndarray, int, bytes]:
+    """Load and validate `pw_v4_e8p_tables.bin` (16 KiB kind 0/1/2 or 32 KiB kind 3 E8P-1024)."""
+    return _tfq_torch.load_pwv4_tables_auto(tables_path)
+
+
+def _normalize_tables_v4(
+    tables_v4: Any,
+) -> tuple[np.ndarray, int, bytes | None] | None:
+    if tables_v4 is None:
+        return None
+    if isinstance(tables_v4, (str, os.PathLike)):
+        return load_and_validate_pwv4_tables(tables_v4)
+    if isinstance(tables_v4, dict):
+        lut = np.asarray(tables_v4["lut"], dtype=np.float32)
+        kind = int(tables_v4["table_kind"])
+        raw = tables_v4.get("raw_bytes")
+        return lut, kind, bytes(raw) if raw is not None else None
+    if isinstance(tables_v4, tuple):
+        if len(tables_v4) == 2:
+            return np.asarray(tables_v4[0], dtype=np.float32), int(tables_v4[1]), None
+        if len(tables_v4) == 3:
+            raw = tables_v4[2]
+            return np.asarray(tables_v4[0], dtype=np.float32), int(tables_v4[1]), bytes(raw) if raw is not None else None
+    raise TypeError(f"Unsupported tables_v4 value of type {type(tables_v4).__name__}")
 
 
 @dataclass(frozen=True)
@@ -109,7 +182,13 @@ class TfpnRecord:
 
 
 def _mat_words(R: int, C: int, bits: int) -> int:
-    return (R // 16) * (C // 128) * (bits * 2) * 32
+    if bits in (3, 4, 5):
+        return (R // 16) * (C // 128) * (bits * 2) * 32
+    if bits == 2:
+        return R * (C // 16)
+    if bits == 225:
+        return R * (C // 128) * 9
+    raise ValueError(f"Unsupported expert bit width {bits} (expected 2, 225, 3, 4, or 5)")
 
 
 def _mat_scales(R: int, C: int) -> int:
@@ -122,6 +201,8 @@ def load_and_validate_tables(tables_path: str | os.PathLike[str]) -> dict[str, A
     sz = os.path.getsize(path)
     if sz < PWV3_MIN_BYTES:
         raise ValueError(f"Truncated pw_v3_tables.bin ({sz} bytes < {PWV3_MIN_BYTES}): {path}")
+    with open(path, "rb") as f:
+        raw_bytes = f.read()
     tbl = tfq3_ref.load_tables(path)
     for bits in (3, 4, 5):
         if not np.isfinite(tbl["a"][bits]) or not np.isfinite(tbl["b"][bits]):
@@ -130,6 +211,7 @@ def load_and_validate_tables(tables_path: str | os.PathLike[str]) -> dict[str, A
             raise ValueError(f"Non-finite LUT entry in {path} for {bits}b")
         if not np.isfinite(tbl["c64"][bits].astype(np.float32)).all():
             raise ValueError(f"Non-finite c64 entry in {path} for {bits}b")
+    tbl["_raw_bytes"] = raw_bytes
     return tbl
 
 
@@ -338,25 +420,43 @@ class TfpwLayer:
     """
     Lazy memory-mapped reader and PyTorch executor for a single `TFPW` v3 MoE layer (`layer_XX.tffpw`).
 
-    Each expert stores three independently rotated matrices in TFQ3 (`3/4/5-bit`):
+    Supports both pure TFQ3 (`3/4/5-bit`) and hybrid TFQ3+TFQ4 (`2/225/3/4/5-bit`) MoE layers:
       - `gate`: `[moe_inter, hidden_size]`
       - `up`:   `[moe_inter, hidden_size]`
       - `down`: `[hidden_size, moe_inter]`
+
+    On CUDA with `tfq3_cuda_ext` installed, `forward_routed()` dispatches `{3, 4, 5}`-bit routed
+    experts to the fused `tfq3_moe` kernel (including Inkling-2 tanh softcap) and `{2, 225}`-bit
+    experts via `tfq4_linear` / exact decode fallback.
     """
 
     def __init__(
         self,
         shard_path: str | os.PathLike[str],
-        tables: dict[str, Any] | str | os.PathLike[str],
+        tables: dict[str, Any] | str | os.PathLike[str] | None = None,
         *,
         verify_checksum: bool = True,
         expected_layer_idx: int | None = None,
         cache_experts: bool = False,
+        tables_v4: Any = None,
     ) -> None:
         self.path = os.fspath(shard_path)
-        self._tables = load_and_validate_tables(tables) if isinstance(tables, (str, os.PathLike)) else tables
+        self._tables: dict[str, Any] | None = (
+            load_and_validate_tables(tables) if isinstance(tables, (str, os.PathLike)) else tables
+        )
+        self._tables_bytes: bytes | None = (
+            _pack_pwv3_tables_bytes(self._tables) if self._tables is not None else None
+        )
+        v4_norm = _normalize_tables_v4(tables_v4)
+        self._tfq4_lut: np.ndarray | None = v4_norm[0] if v4_norm is not None else None
+        self._tfq4_table_kind: int | None = v4_norm[1] if v4_norm is not None else None
+        self._tfq4_raw_bytes: bytes | None = v4_norm[2] if v4_norm is not None else None
+
         self.cache_experts = bool(cache_experts)
         self._expert_cache: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+        self._cuda_moe_cache: dict[torch.device, tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+        self._tfq4_lut_dev_cache: dict[tuple[torch.device, int], torch.Tensor] = {}
+        self._meta_bytes: bytes = b""
         self._file = open(self.path, "rb")
         self._mm: mmap.mmap | None = None
         self._scales: np.ndarray | None = None
@@ -437,16 +537,27 @@ class TfpwLayer:
                             )
                     self.checksum_verified = True
 
+                self._meta_bytes = bytes(mv[off_meta : off_meta + meta_bytes])
+
                 n_sc_gu = _mat_scales(inter, hidden)
                 n_sc_dn = _mat_scales(hidden, inter)
                 experts: list[TfpwExpertMeta] = []
+                need_v3 = False
+                need_v4 = False
+                need_v4_1024 = False
                 for e in range(n_exp):
                     e_off = off_meta + e * TFPW_EXPERT_META_BYTES
                     b_bits, hrank, gw, uw, dw, gs, us, ds, gsnr, usnr, dsnr, _, _ = struct.unpack_from(
                         "<IIQQQIIIfffII", mv, e_off
                     )
-                    if b_bits not in (3, 4, 5):
+                    if b_bits not in (2, 225, 3, 4, 5):
                         raise ValueError(f"Invalid expert bit width {b_bits} for L{layer_idx} E{e} in {self.path}")
+                    if b_bits in (3, 4, 5):
+                        need_v3 = True
+                    else:
+                        need_v4 = True
+                        if b_bits == 225:
+                            need_v4_1024 = True
                     if b_bits == 4 and ((gw % 4) != 0 or (uw % 4) != 0 or (dw % 4) != 0):
                         raise ValueError(f"Misaligned 4-bit expert word offset for L{layer_idx} E{e} in {self.path}")
                     gu_words = _mat_words(inter, hidden, b_bits)
@@ -476,7 +587,36 @@ class TfpwLayer:
                             down_snr_db=dsnr,
                         )
                     )
+
+                # Auto-load sibling table binaries when required by expert bit widths
+                shard_dir = os.path.dirname(os.path.abspath(self.path))
+                if need_v3 and self._tables is None:
+                    cand_v3 = os.path.join(shard_dir, "pw_v3_tables.bin")
+                    if os.path.isfile(cand_v3):
+                        self._tables = load_and_validate_tables(cand_v3)
+                        self._tables_bytes = _pack_pwv3_tables_bytes(self._tables)
+                    else:
+                        raise ValueError(
+                            f"TFPW layer {self.path} contains 3/4/5-bit experts but no pw_v3_tables.bin was provided"
+                        )
+                if need_v4 and self._tfq4_lut is None:
+                    cand_v4 = os.path.join(shard_dir, "pw_v4_e8p_tables.bin")
+                    if os.path.isfile(cand_v4):
+                        self._tfq4_lut, self._tfq4_table_kind, self._tfq4_raw_bytes = load_and_validate_pwv4_tables(cand_v4)
+                    else:
+                        raise ValueError(
+                            f"TFPW layer {self.path} contains TFQ4 (2/225-bit) experts but no pw_v4_e8p_tables.bin was provided"
+                        )
+                if need_v4_1024 and self._tfq4_table_kind != _tfq_torch.PWV4_TABLE_TRUE_E8P_1024:
+                    raise ValueError(
+                        f"TFPW layer {self.path} contains 2.25 bpw (b_bits=225) experts but pw_v4_e8p_tables.bin "
+                        f"has table_kind={self._tfq4_table_kind} (expected 3)"
+                    )
+
                 self.experts = experts
+                self.is_hybrid = need_v3 and need_v4
+                self.has_tfq4_experts = need_v4
+                self.has_tfq3_experts = need_v3
             finally:
                 mv.release()
 
@@ -498,7 +638,59 @@ class TfpwLayer:
         return dict(sorted(hist.items()))
 
     def avg_bpw(self) -> float:
-        return sum(em.b_bits for em in self.experts) / float(self.num_experts)
+        return sum(_bits_to_bpw(em.b_bits) for em in self.experts) / float(self.num_experts)
+
+    def _effective_tfq4_lut_kind(self, b_bits: int) -> tuple[np.ndarray, int]:
+        if self._tfq4_lut is None or self._tfq4_table_kind is None:
+            raise RuntimeError("TFQ4 tables not loaded for this TfpwLayer")
+        if b_bits == 225:
+            return self._tfq4_lut, _tfq_torch.PWV4_TABLE_TRUE_E8P_1024
+        eff_kind = (
+            _tfq_torch.PWV4_TABLE_TRUE_E8P
+            if self._tfq4_table_kind == _tfq_torch.PWV4_TABLE_TRUE_E8P_1024
+            else self._tfq4_table_kind
+        )
+        return self._tfq4_lut[:256], eff_kind
+
+    def _get_cuda_moe_buffers(self, device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        cached = self._cuda_moe_cache.get(device)
+        if cached is not None:
+            return cached
+        if self._words is None or self._scales is None or self._tables_bytes is None:
+            raise RuntimeError("TfpwLayer buffers or PWV3 tables unavailable for CUDA MoE")
+        w_t = torch.from_numpy(self._words.view(np.int32).copy()).to(device=device)
+        s_t = torch.from_numpy(self._scales.copy()).to(device=device)
+        m_t = torch.from_numpy(np.frombuffer(self._meta_bytes, dtype=np.uint8).copy()).to(device=device)
+        t_t = torch.from_numpy(np.frombuffer(self._tables_bytes, dtype=np.uint8).copy()).to(device=device)
+        cached = (w_t, s_t, m_t, t_t)
+        self._cuda_moe_cache[device] = cached
+        return cached
+
+    def _get_tfq4_lut_tensor(self, device: torch.device, b_bits: int) -> tuple[torch.Tensor, int]:
+        lut_np, eff_kind = self._effective_tfq4_lut_kind(b_bits)
+        key = (device, eff_kind)
+        t = self._tfq4_lut_dev_cache.get(key)
+        if t is None:
+            t = torch.from_numpy(lut_np.astype(np.float16).copy()).to(device=device)
+            self._tfq4_lut_dev_cache[key] = t
+        return t, eff_kind
+
+    @staticmethod
+    def _apply_glu(
+        g: torch.Tensor,
+        u: torch.Tensor,
+        *,
+        swiglu_limit: float | None = None,
+        gate_softcap: float | None = None,
+        up_softcap: float | None = None,
+    ) -> torch.Tensor:
+        if gate_softcap is not None or up_softcap is not None:
+            g_cap = (gate_softcap * torch.tanh(g / gate_softcap)) if gate_softcap is not None else g
+            u_cap = (up_softcap * torch.tanh(u / up_softcap)) if up_softcap is not None else u
+            return g_cap * torch.sigmoid(g) * u_cap
+        if swiglu_limit is not None and swiglu_limit > 0.0:
+            return F.silu(g.clamp(max=swiglu_limit)) * u.clamp(min=-swiglu_limit, max=swiglu_limit)
+        return F.silu(g) * u
 
     def decode_expert(
         self,
@@ -510,6 +702,7 @@ class TfpwLayer:
         """
         Lazily decode routed expert `expert_idx` directly from the memory-mapped `TFPW` shard.
 
+        Supports both TFQ3 (`3/4/5-bit`) and TFQ4-E8P (`2`/`225`-bit) experts.
         Returns `(W_gate, W_up, W_down)` with shapes:
           - `W_gate`: `[moe_inter, hidden_size]`
           - `W_up`:   `[moe_inter, hidden_size]`
@@ -536,21 +729,40 @@ class TfpwLayer:
         n_sc_gu = _mat_scales(I, H)
         n_sc_dn = _mat_scales(H, I)
 
-        wg_np = tfq3_ref.decode_tfpn_fast_np(
-            self._words[em.gate_word_off : em.gate_word_off + gu_words],
-            self._scales[em.gate_sc_off : em.gate_sc_off + n_sc_gu].reshape(I // 128, H // 128),
-            I, H, bits, self._tables,
-        )
-        wu_np = tfq3_ref.decode_tfpn_fast_np(
-            self._words[em.up_word_off : em.up_word_off + gu_words],
-            self._scales[em.up_sc_off : em.up_sc_off + n_sc_gu].reshape(I // 128, H // 128),
-            I, H, bits, self._tables,
-        )
-        wd_np = tfq3_ref.decode_tfpn_fast_np(
-            self._words[em.down_word_off : em.down_word_off + dn_words],
-            self._scales[em.down_sc_off : em.down_sc_off + n_sc_dn].reshape(H // 128, I // 128),
-            H, I, bits, self._tables,
-        )
+        if bits in (3, 4, 5):
+            assert self._tables is not None
+            wg_np = tfq3_ref.decode_tfpn_fast_np(
+                self._words[em.gate_word_off : em.gate_word_off + gu_words],
+                self._scales[em.gate_sc_off : em.gate_sc_off + n_sc_gu].reshape(I // 128, H // 128),
+                I, H, bits, self._tables,
+            )
+            wu_np = tfq3_ref.decode_tfpn_fast_np(
+                self._words[em.up_word_off : em.up_word_off + gu_words],
+                self._scales[em.up_sc_off : em.up_sc_off + n_sc_gu].reshape(I // 128, H // 128),
+                I, H, bits, self._tables,
+            )
+            wd_np = tfq3_ref.decode_tfpn_fast_np(
+                self._words[em.down_word_off : em.down_word_off + dn_words],
+                self._scales[em.down_sc_off : em.down_sc_off + n_sc_dn].reshape(H // 128, I // 128),
+                H, I, bits, self._tables,
+            )
+        else:
+            lut_np, eff_kind = self._effective_tfq4_lut_kind(bits)
+            wg_np = _tfq_torch.decode_tfq4_words_np(
+                self._words[em.gate_word_off : em.gate_word_off + gu_words],
+                self._scales[em.gate_sc_off : em.gate_sc_off + n_sc_gu].reshape(I // 128, H // 128),
+                I, H, lut_np, eff_kind,
+            )
+            wu_np = _tfq_torch.decode_tfq4_words_np(
+                self._words[em.up_word_off : em.up_word_off + gu_words],
+                self._scales[em.up_sc_off : em.up_sc_off + n_sc_gu].reshape(I // 128, H // 128),
+                I, H, lut_np, eff_kind,
+            )
+            wd_np = _tfq_torch.decode_tfq4_words_np(
+                self._words[em.down_word_off : em.down_word_off + dn_words],
+                self._scales[em.down_sc_off : em.down_sc_off + n_sc_dn].reshape(H // 128, I // 128),
+                H, I, lut_np, eff_kind,
+            )
 
         wg_cpu = torch.from_numpy(np.ascontiguousarray(wg_np))
         wu_cpu = torch.from_numpy(np.ascontiguousarray(wu_np))
@@ -563,6 +775,62 @@ class TfpwLayer:
             wu_cpu.to(device=device, dtype=dtype),
             wd_cpu.to(device=device, dtype=dtype),
         )
+
+    def _forward_tfq4_expert_fused(
+        self,
+        x: torch.Tensor,
+        em: TfpwExpertMeta,
+        *,
+        swiglu_limit: float | None = None,
+        gate_softcap: float | None = None,
+        up_softcap: float | None = None,
+    ) -> torch.Tensor | None:
+        """Zero-expansion CUDA or MPS fused execution for a single TFQ4 (2 / 225 bpw) expert."""
+        assert self._words is not None and self._scales is not None
+        H, I, bits = self.hidden_size, self.moe_inter, em.b_bits
+        gu_words = _mat_words(I, H, bits)
+        dn_words = _mat_words(H, I, bits)
+        n_sc_gu = _mat_scales(I, H)
+        n_sc_dn = _mat_scales(H, I)
+
+        if x.is_cuda:
+            ext = _get_cuda_ext()
+            if ext is None or not hasattr(ext, "tfq4_linear"):
+                return None
+            lut_t, eff_kind = self._get_tfq4_lut_tensor(x.device, bits)
+            if eff_kind > int(getattr(ext, "TFQ4_MAX_TABLE_KIND", 2)):
+                return None
+            wg = torch.from_numpy(self._words[em.gate_word_off : em.gate_word_off + gu_words].view(np.int32).copy()).to(x.device)
+            wu = torch.from_numpy(self._words[em.up_word_off : em.up_word_off + gu_words].view(np.int32).copy()).to(x.device)
+            wd = torch.from_numpy(self._words[em.down_word_off : em.down_word_off + dn_words].view(np.int32).copy()).to(x.device)
+            sg = torch.from_numpy(self._scales[em.gate_sc_off : em.gate_sc_off + n_sc_gu].copy()).to(x.device)
+            su = torch.from_numpy(self._scales[em.up_sc_off : em.up_sc_off + n_sc_gu].copy()).to(x.device)
+            sd = torch.from_numpy(self._scales[em.down_sc_off : em.down_sc_off + n_sc_dn].copy()).to(x.device)
+            x_bf = x.to(torch.bfloat16)
+            g = ext.tfq4_linear(x_bf, wg, sg, lut_t, eff_kind, I, H, I).to(torch.float32)
+            u = ext.tfq4_linear(x_bf, wu, su, lut_t, eff_kind, I, H, I).to(torch.float32)
+            act = self._apply_glu(g, u, swiglu_limit=swiglu_limit, gate_softcap=gate_softcap, up_softcap=up_softcap).to(torch.bfloat16)
+            y = ext.tfq4_linear(act, wd, sd, lut_t, eff_kind, H, I, H)
+            return y.to(dtype=x.dtype)
+
+        if x.device.type == "mps":
+            mps = _get_mps_mod()
+            if mps is None:
+                return None
+            lut_t, eff_kind = self._get_tfq4_lut_tensor(x.device, bits)
+            wg = torch.from_numpy(self._words[em.gate_word_off : em.gate_word_off + gu_words].view(np.int32).copy()).to(x.device)
+            wu = torch.from_numpy(self._words[em.up_word_off : em.up_word_off + gu_words].view(np.int32).copy()).to(x.device)
+            wd = torch.from_numpy(self._words[em.down_word_off : em.down_word_off + dn_words].view(np.int32).copy()).to(x.device)
+            sg = torch.from_numpy(self._scales[em.gate_sc_off : em.gate_sc_off + n_sc_gu].copy()).to(x.device)
+            su = torch.from_numpy(self._scales[em.up_sc_off : em.up_sc_off + n_sc_gu].copy()).to(x.device)
+            sd = torch.from_numpy(self._scales[em.down_sc_off : em.down_sc_off + n_sc_dn].copy()).to(x.device)
+            g = mps.tfq4_linear_mps(x.to(torch.float32), wg, sg, lut_t, eff_kind, I, H, I)
+            u = mps.tfq4_linear_mps(x.to(torch.float32), wu, su, lut_t, eff_kind, I, H, I)
+            act = self._apply_glu(g, u, swiglu_limit=swiglu_limit, gate_softcap=gate_softcap, up_softcap=up_softcap)
+            y = mps.tfq4_linear_mps(act, wd, sd, lut_t, eff_kind, H, I, H)
+            return y.to(dtype=x.dtype)
+
+        return None
 
     def forward_expert(
         self,
@@ -582,18 +850,45 @@ class TfpwLayer:
         """
         if x.shape[-1] != self.hidden_size:
             raise ValueError(f"Expected input last dim {self.hidden_size}, got {x.shape[-1]}")
+        em = self.experts[expert_idx]
+
+        # Fused CUDA / MPS dispatch when not using decoded CPU cache
+        if not self.cache_experts:
+            if em.b_bits in (3, 4, 5) and x.is_cuda:
+                ext = _get_cuda_ext()
+                if ext is not None and hasattr(ext, "tfq3_moe"):
+                    orig_shape = list(x.shape)
+                    x2d = x.reshape(-1, self.hidden_size).to(torch.bfloat16)
+                    w_t, s_t, m_t, t_t = self._get_cuda_moe_buffers(x.device)
+                    picks = torch.full((x2d.shape[0], 1), int(expert_idx), dtype=torch.int32, device=x.device)
+                    ey = ext.tfq3_moe(
+                        x2d,
+                        w_t,
+                        s_t,
+                        m_t,
+                        t_t,
+                        picks,
+                        self.hidden_size,
+                        self.moe_inter,
+                        self.num_experts,
+                        float(swiglu_limit or 0.0),
+                        0,
+                        float(gate_softcap or 0.0),
+                        float(up_softcap or 0.0),
+                    )
+                    return ey.squeeze(1).reshape(orig_shape).to(dtype=x.dtype)
+            elif em.b_bits in (2, 225) and (x.is_cuda or x.device.type == "mps"):
+                y_fused = self._forward_tfq4_expert_fused(
+                    x, em, swiglu_limit=swiglu_limit, gate_softcap=gate_softcap, up_softcap=up_softcap
+                )
+                if y_fused is not None:
+                    return y_fused
+
         wg, wu, wd = self.decode_expert(expert_idx, dtype=torch.float32, device=x.device)
         x32 = x.to(torch.float32)
         g = F.linear(x32, wg)
         u = F.linear(x32, wu)
-        if gate_softcap is not None or up_softcap is not None:
-            g_cap = (gate_softcap * torch.tanh(g / gate_softcap)) if gate_softcap is not None else g
-            u_cap = (up_softcap * torch.tanh(u / up_softcap)) if up_softcap is not None else u
-            act = g_cap * torch.sigmoid(g) * u_cap
-        elif swiglu_limit is not None and swiglu_limit > 0.0:
-            act = F.silu(g.clamp(max=swiglu_limit)) * u.clamp(min=-swiglu_limit, max=swiglu_limit)
-        else:
-            act = F.silu(g) * u
+        act = self._apply_glu(g, u, swiglu_limit=swiglu_limit, gate_softcap=gate_softcap, up_softcap=up_softcap)
         return F.linear(act, wd).to(dtype=x.dtype)
 
     def forward_routed(
@@ -608,15 +903,72 @@ class TfpwLayer:
     ) -> torch.Tensor:
         """
         Execute top-k routed MoE over `x [T, H]`, `expert_ids [T, K]`, `expert_weights [T, K]`.
-        Decodes each active expert once per call and accumulates weighted outputs in ascending expert ID order.
+
+        On CUDA with `tfq3_cuda_ext` installed, dispatches `{3, 4, 5}`-bit experts via the fused
+        `tfq3_moe` CUDA kernel (including Inkling-2 tanh softcap) and seamlessly executes any
+        `{2, 225}`-bit TFQ4 cold experts via per-expert TFQ4 dispatch, combining all weighted
+        outputs in ascending expert ID order.
         """
         if x.ndim != 2 or expert_ids.ndim != 2 or expert_weights.ndim != 2:
             raise ValueError("forward_routed expects 2D x [T, H], expert_ids [T, K], and expert_weights [T, K]")
         T, H = x.shape
         if H != self.hidden_size or expert_ids.shape != expert_weights.shape or expert_ids.shape[0] != T:
             raise ValueError("Mismatched shapes in forward_routed")
+        if T == 0 or expert_ids.shape[1] == 0:
+            return torch.zeros((T, H), dtype=x.dtype, device=x.device)
+
+        active = sorted(int(e) for e in torch.unique(expert_ids).tolist() if 0 <= int(e) < self.num_experts)
+
+        # Fused CUDA tfq3_moe fast path for {3, 4, 5}-bit experts (+ seamless TFQ4 hybrid fallback for {2, 225})
+        if x.is_cuda and self.has_tfq3_experts:
+            ext = _get_cuda_ext()
+            if ext is not None and hasattr(ext, "tfq3_moe"):
+                tfq3_active = [e for e in active if self.experts[e].b_bits in (3, 4, 5)]
+                tfq4_active = [e for e in active if self.experts[e].b_bits in (2, 225)]
+                if tfq3_active:
+                    w_t, s_t, m_t, t_t = self._get_cuda_moe_buffers(x.device)
+                    picks_i32 = expert_ids.to(device=x.device, dtype=torch.int32).contiguous()
+                    if tfq4_active:
+                        picks_tfq3 = picks_i32.clone()
+                        for eid in tfq4_active:
+                            picks_tfq3.masked_fill_(picks_tfq3 == eid, -1)
+                    else:
+                        picks_tfq3 = picks_i32
+                    ey = ext.tfq3_moe(
+                        x.to(torch.bfloat16),
+                        w_t,
+                        s_t,
+                        m_t,
+                        t_t,
+                        picks_tfq3,
+                        self.hidden_size,
+                        self.moe_inter,
+                        self.num_experts,
+                        float(swiglu_limit or 0.0),
+                        0,
+                        float(gate_softcap or 0.0),
+                        float(up_softcap or 0.0),
+                    )  # [T, K, H] bf16
+
+                    out = torch.zeros((T, H), dtype=torch.float32, device=x.device)
+                    tfq4_set = set(tfq4_active)
+                    for eid in active:
+                        tok_idx, slot_idx = torch.where(expert_ids == eid)
+                        if eid in tfq4_set:
+                            y_e = self.forward_expert(
+                                x[tok_idx],
+                                eid,
+                                swiglu_limit=swiglu_limit,
+                                gate_softcap=gate_softcap,
+                                up_softcap=up_softcap,
+                            ).to(torch.float32)
+                        else:
+                            y_e = ey[tok_idx, slot_idx].to(torch.float32)
+                        w_e = expert_weights[tok_idx, slot_idx].to(torch.float32).unsqueeze(-1)
+                        out.index_add_(0, tok_idx, y_e * w_e)
+                    return out.to(dtype=x.dtype)
+
         out = torch.zeros((T, H), dtype=torch.float32, device=x.device)
-        active = sorted(int(e) for e in torch.unique(expert_ids).tolist())
         for eid in active:
             tok_idx, slot_idx = torch.where(expert_ids == eid)
             y_e = self.forward_expert(
@@ -632,9 +984,13 @@ class TfpwLayer:
 
     def clear_cache(self) -> None:
         self._expert_cache.clear()
+        self._cuda_moe_cache.clear()
+        self._tfq4_lut_dev_cache.clear()
 
     def close(self) -> None:
         self._expert_cache.clear()
+        self._cuda_moe_cache.clear()
+        self._tfq4_lut_dev_cache.clear()
         self._scales = None
         self._words = None
         if self._mm is not None:
@@ -700,10 +1056,24 @@ class TfpwCheckpoint:
             with open(cfg_path, "r", encoding="utf-8") as f:
                 self.config = json.load(f)
 
-        self.tables_path = os.path.join(self.ckpt_dir, "pw_v3_tables.bin")
-        if not os.path.isfile(self.tables_path):
-            raise FileNotFoundError(f"Missing pw_v3_tables.bin in {self.ckpt_dir}")
-        self.tables = load_and_validate_tables(self.tables_path)
+        self.tables_path: str | None = os.path.join(self.ckpt_dir, "pw_v3_tables.bin")
+        self.tables_v4_path: str | None = os.path.join(self.ckpt_dir, "pw_v4_e8p_tables.bin")
+        self.tables: dict[str, Any] | None = None
+        self.tables_v4: tuple[np.ndarray, int, bytes] | None = None
+
+        if os.path.isfile(self.tables_path):
+            self.tables = load_and_validate_tables(self.tables_path)
+        else:
+            self.tables_path = None
+        if os.path.isfile(self.tables_v4_path):
+            self.tables_v4 = load_and_validate_pwv4_tables(self.tables_v4_path)
+        else:
+            self.tables_v4_path = None
+
+        if self.tables is None and self.tables_v4 is None:
+            raise FileNotFoundError(
+                f"Missing pw_v3_tables.bin (and pw_v4_e8p_tables.bin) in {self.ckpt_dir}"
+            )
 
         self.layers: dict[int, TfpwLayer] = {}
         self.layer_paths: dict[int, str] = {}
@@ -729,6 +1099,7 @@ class TfpwCheckpoint:
                     verify_checksum=verify_checksums,
                     expected_layer_idx=idx,
                     cache_experts=cache_experts,
+                    tables_v4=self.tables_v4,
                 )
                 self.layers[idx] = lyr
                 self.layer_paths[idx] = path
@@ -740,11 +1111,14 @@ class TfpwCheckpoint:
                     self.tables,
                     verify_checksum=verify_checksums,
                     cache_experts=cache_experts,
+                    tables_v4=self.tables_v4,
                 )
 
             # 2. Optional nonmoe.tffpw (absent in Inkling-2 default and GLM --keep-nonmoe-bf16)
             nm_path = os.path.join(self.ckpt_dir, "nonmoe.tffpw")
             if os.path.isfile(nm_path):
+                if self.tables is None:
+                    raise FileNotFoundError(f"Found nonmoe.tffpw but missing pw_v3_tables.bin in {self.ckpt_dir}")
                 self.nonmoe_path = nm_path
                 self.nonmoe = TfpnNonMoeShard(nm_path, self.tables, verify_checksum=verify_checksums)
 
@@ -931,7 +1305,8 @@ class TfpwCheckpoint:
                 bit_hist[b] = bit_hist.get(b, 0) + cnt
         first = self.layers[self.layer_indices[0]]
         tot_experts = sum(bit_hist.values())
-        avg_bpw = sum(b * c for b, c in bit_hist.items()) / float(max(tot_experts, 1))
+        avg_bpw = sum(_bits_to_bpw(b) * c for b, c in bit_hist.items()) / float(max(tot_experts, 1))
+        is_hybrid = any(b in (2, 225) for b in bit_hist) and any(b in (3, 4, 5) for b in bit_hist)
         return {
             "ckpt_dir": self.ckpt_dir,
             "family": self.family,
@@ -943,6 +1318,9 @@ class TfpwCheckpoint:
             "moe_inter": first.moe_inter,
             "bit_histogram": dict(sorted(bit_hist.items())),
             "avg_bpw": avg_bpw,
+            "is_hybrid": is_hybrid,
+            "has_tfq4_tables": self.tables_v4 is not None,
+            "tfq4_table_kind": self.tables_v4[1] if self.tables_v4 is not None else None,
             "total_tfpw_bytes": total_tfpw_bytes,
             "has_nonmoe_tfq3": self.has_nonmoe_tfq3,
             "nonmoe_mode": self.nonmoe_mode,

@@ -6,7 +6,7 @@
 
 **Cross-Platform: Apple Silicon (Metal) & NVIDIA GPUs (CUDA `sm_80+`) · Standalone PyTorch / Hugging Face / vLLM & TensorFold**
 
-**TFQ3** (*TensorFold Quantization v3 — supports **3-, 4-, and 5-bit**, including mixed-bit per layer or per expert; `3` is the format version, not 3-bit only*) and **TFQ4-E8P** (`2.001 bpw` 8D E8-initialized Voronoi codebook) provide a fast, **data-free by default** (with **optional Hessian-LDLQ calibration** and **optional trace-guided MoE HeatAlloc**) weight quantization format, GPU converter suite, and standalone inference kernels.
+**TFQ3** (*TensorFold Quantization v3 — supports **3-, 4-, and 5-bit**, including mixed-bit per layer or per expert; `3` is the format version, not 3-bit only*) and **TFQ4-E8P** (`2.001 bpw` 256-entry & `2.251 bpw` 1024-entry True QuIP# $E_8 + \frac{1}{4}$ lattices, standalone or mixed with `4b/3b` TFQ3 in hybrid hot/cold MoE shards) provide a fast, **data-free by default** (with **optional Hessian-LDLQ calibration** and **optional trace-guided MoE HeatAlloc**) weight quantization format, GPU converter suite, and standalone inference kernels.
 
 > **One Checkpoint Format, Byte-Identical Conversion Across Platforms:**
 > The same `.tffpw`/`.tffp4` checkpoint file runs unmodified on both Apple Silicon (Metal) and NVIDIA GPUs (CUDA `sm_80+`), and both Metal and CUDA converters emit **byte-for-byte identical files** (matching SHA-256) from the same source weights via embedded canonical tables (`reference/tables/`) and deterministic IEEE-754 encoder paths. *(Inference kernels on Metal vs CUDA use each architecture's native MMA and reduction schedules, so cross-vendor inference outputs match within normal fp16/bf16 rounding tolerance.)*
@@ -40,20 +40,18 @@ tfq3 meta-llama/Llama-3.1-8B-Instruct --target-gib 5.0
 # Auto-fit to this machine's available GPU memory (data-free mixed 3b/4b/5b sensitivity planner)
 tfq3 /path/to/any-safetensors-model --fit auto
 
-# Quantize vision encoders, speculative drafters, embeddings, or 2.001 bpw TFQ4-E8P
+# Quantize vision encoders, speculative drafters, embeddings, or 2.001 / 2.251 bpw TFQ4-E8P
 tfq3 /path/to/Qwen3.8-27B-DFlash2 --quantize-drafter --bits 4
-tfq3 /path/to/Qwen2.5-1.5B --bits 2 --quantize-embed   # 2.001 bpw TFQ4-E8P -> 0.360 GiB in 1.3 s
+tfq3 /path/to/Qwen2.5-1.5B --bits 2 --table-kind e8p --quantize-embed        # 2.001 bpw True E8P-256
+tfq3 /path/to/Qwen2.5-1.5B --bits 2.25 --table-kind e8p1024                  # 2.251 bpw True E8P-1024 (-73.2% PPL vs 2.0b)
 
-# GLM-5.3-Flash: compact (3.39 bpw avg + 4b non-MoE) OR matched uniform-4b + full-precision non-MoE
-tfq3 /path/to/GLM-5.3-Flash-FP8 --glm-mode uniform4 --keep-nonmoe-bf16
-# ...or the routed experts from the BF16 checkpoint (Metal & CUDA; non-MoE stays in the source)
-tfq3 zai-org/GLM-5.3-Flash-BF16 --glm-mode uniform4 --keep-nonmoe-bf16
+# Hybrid hot/cold MoE (4b/3b TFQ3 hot experts + 2.0b/2.25b TFQ4-E8P cold experts in one TFPW shard)
+tfq3 /path/to/GLM-5.3-Flash-FP8 --glm-mode heat43225 --keep-nonmoe-bf16      # ~2.70 bpw MoE + BF16 non-MoE
+tfq3 /path/to/Inkling-2-Mini --mode heat43225                                # 7.68 GiB (-32.6% vs uniform4)
 
-# ERNIE-5.5-Flash (CUDA): uniform 3b/4b/5b routed experts from the BF16 checkpoint; other tensors stay in the source
-tfq3 baidu/ERNIE-5.5-Flash-Preview-BF16 --profile 4b
-
-# Validate any TFQ3/TFQ4 checkpoint & check local toolchain
+# Validate, inspect, or evaluate & export a Hugging Face model card
 tfq3 inspect -v ./Qwen3.8-27B-TFQ3
+tfq3-eval --checkpoint ./Qwen2.5-1.5B-TFQ3 --ref-model Qwen/Qwen2.5-1.5B --model-card MODEL_CARD_SNIPPET.md
 tfq3 doctor
 ```
 
@@ -153,8 +151,9 @@ make test-tfq4-cuda CUDA_ARCH=sm_121
 - **[`docs/HOW_IT_WORKS.md`](docs/HOW_IT_WORKS.md)** — Mathematical formulation of `2D FWHT-128`, `2D-AffineCoset/half4`, state-hash split-K resume, and Metal/CUDA execution.
 - **[`docs/FORMAT_SPEC.md`](docs/FORMAT_SPEC.md)** — Byte-level binary specification for `PWV3`/`PWV4` tables and `TFPN`/`TFPW`/`TFP4` shards.
 - **[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md)** — Full provenance-tagged benchmarks (`[MEASURED]` / `[SOURCE-INSPECTED]` / `[NOT VERIFIED]`), plus undrafted GB10 dense receipt [`benchmarks/qwen38_27b_gb10_undrafted.json`](benchmarks/qwen38_27b_gb10_undrafted.json).
-- **[`docs/TFQ4_SUB3BIT.md`](docs/TFQ4_SUB3BIT.md)** — Sub-3-bit (`2.001 bpw`) `TFQ4-E8P` cold-expert lattice format (both trained `table_kind=0/1` and True QuIP# E8P `table_kind=2`) and Metal/CUDA kernels.
+- **[`docs/TFQ4_SUB3BIT.md`](docs/TFQ4_SUB3BIT.md)** — Sub-3-bit (`2.001` & `2.251 bpw`) `TFQ4-E8P` lattice format (`table_kind=0/1/2/3`), hybrid hot/cold MoE (`heat432` / `heat43225`), and Metal/CUDA kernels.
 - **[`docs/TENSORFOLD_LOADER_SPEC.md`](docs/TENSORFOLD_LOADER_SPEC.md)** — Runtime integration spec for GLM `--keep-nonmoe-bf16` and Inkling-2 `TFPW` v3 checkpoints.
+- **[`tools/tfq3_eval.py`](tools/tfq3_eval.py)** — `tfq3-eval` CLI for offline `XXH64` inspection, WikiText-2 PPL, paired full-vocab `fp64` KL, throughput benchmarks, and Hugging Face model-card generation.
 - **[`tools/tfq3_hessian.py`](tools/tfq3_hessian.py)** — Optional calibration-aware Hessian-weighted Beam-Viterbi + LDLQ encoder (`TFPN`/`TFP4`) and Safetensors Hessian exporter (`--export-hessians` / `--load-hessians`).
 - **[`tools/bench_quantizers.py`](tools/bench_quantizers.py)** — Reproducible WikiText-2 PPL, full-vocab KL, and real-activation Output SNR benchmark + SHA-256 provenance generator.
 - **[`integrations/`](integrations/README.md)** — Standalone PyTorch, Hugging Face `transformers`, and vLLM integrations.

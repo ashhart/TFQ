@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tfq3"
-version = "3.0.0"
-description = "TensorFold Native Quantization (TFQ3 3/4/5-bit & TFQ4 2-bit E8P, Metal & CUDA)"
+version = "3.1.0"
+description = "TensorFold Native Quantization (TFQ3 3/4/5-bit & TFQ4 2.00/2.25 bpw E8P, Metal & CUDA)"
 readme = "README.md"
 license = {text = "Apache-2.0"}
 requires-python = ">=3.10"
@@ -16,7 +16,11 @@ dependencies = [
 [project.optional-dependencies]
 torch = ["torch>=2.3"]
 hf = ["torch>=2.3", "transformers>=4.44", "safetensors>=0.4"]
+eval = ["torch>=2.3", "transformers>=4.44", "safetensors>=0.4", "datasets>=2.18"]
 vllm = ["torch>=2.3", "vllm>=0.6"]
+
+[project.scripts]
+tfq3-eval = "tfq3:eval_main"
 
 [project.urls]
 Homepage = "https://github.com/ashhart/TFQ"
@@ -30,6 +34,7 @@ packages = [
     "tfq3.pytorch",
     "tfq3.vllm",
     "tfq3.metal",
+    "tfq3.tools",
 ]
 include-package-data = true
 
@@ -39,6 +44,7 @@ tfq3 = "tfq3"
 "tfq3.pytorch" = "integrations/pytorch"
 "tfq3.vllm" = "integrations/vllm"
 "tfq3.metal" = "src/kernels/metal"
+"tfq3.tools" = "tools"
 
 [tool.setuptools.package-data]
 "tfq3.reference" = ["tables/*.bin"]
