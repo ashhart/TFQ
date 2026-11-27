@@ -21,6 +21,7 @@
 namespace fs = std::filesystem;
 
 struct Tfq4MatParams { uint32_t R, C, r_off, pad0; };
+struct Tfq4ScaleParams { uint32_t n_blocks; float scale_mult; };
 
 static std::string default_metallib(const char* name) {
     uint32_t sz = 0; _NSGetExecutablePath(nullptr, &sz);
@@ -58,6 +59,7 @@ int main(int argc, char** argv) {
         opt.default_bits = 3;
         opt.head_bits = 0;
         double max_shard_gib = 3.4;
+        uint32_t table_kind = tfq4::PWV4_TABLE_LEGACY_TRAINED;
         std::string metallib = default_metallib("tfq4-convert.metallib");
         for (int i = 1; i < argc; ++i) {
             std::string a = argv[i];
@@ -69,14 +71,24 @@ int main(int argc, char** argv) {
             else if (a == "--quantize-embed") opt.quantize_embed = true;
             else if (a == "--head-bits" && i + 1 < argc) opt.head_bits = (uint32_t)std::stoul(argv[++i]);
             else if (a == "--max-shard-gib" && i + 1 < argc) max_shard_gib = std::stod(argv[++i]);
+            else if (a == "--table-kind" && i + 1 < argc) {
+                std::string k = argv[++i];
+                if (k == "trained" || k == "0") table_kind = tfq4::PWV4_TABLE_LEGACY_TRAINED;
+                else if (k == "1") table_kind = tfq4::PWV4_TABLE_TRAINED;
+                else if (k == "e8p" || k == "true-e8p" || k == "2") table_kind = tfq4::PWV4_TABLE_TRUE_E8P;
+                else {
+                    fprintf(stderr, "tfq4-convert: invalid --table-kind '%s' (expected trained|e8p|0|1|2)\n", k.c_str());
+                    return 2;
+                }
+            }
             else if (a == "--dry-run") opt.dry_run = true;
             else if (a == "-h" || a == "--help") {
-                printf("Usage: tfq4-convert --model DIR --out DIR [--head-bits 0|2] [--max-shard-gib 3.4] [--quantize-vision] [--quantize-drafter] [--quantize-embed] [--dry-run]\n");
+                printf("Usage: tfq4-convert --model DIR --out DIR [--head-bits 0|2] [--table-kind trained|e8p] [--max-shard-gib 3.4] [--quantize-vision] [--quantize-drafter] [--quantize-embed] [--dry-run]\n");
                 return 0;
             }
         }
         if (opt.model_dir.empty() || opt.out_dir.empty()) {
-            fprintf(stderr, "Usage: tfq4-convert --model DIR --out DIR [--head-bits 0|2] [--max-shard-gib 3.4] [--quantize-vision] [--quantize-drafter] [--quantize-embed] [--dry-run]\n");
+            fprintf(stderr, "Usage: tfq4-convert --model DIR --out DIR [--head-bits 0|2] [--table-kind trained|e8p] [--max-shard-gib 3.4] [--quantize-vision] [--quantize-drafter] [--quantize-embed] [--dry-run]\n");
             return 2;
         }
         if (opt.head_bits != 0u && opt.head_bits != 2u) {
@@ -117,15 +129,21 @@ int main(int argc, char** argv) {
             if (!pso) { fprintf(stderr, "PSO error %s: %s\n", nm, [[err localizedDescription] UTF8String]); std::exit(1); }
             return pso;
         };
+        const bool use_true_e8p = (table_kind == tfq4::PWV4_TABLE_TRUE_E8P);
         id<MTLComputePipelineState> p_rfwht = mk("f32_row_fwht");
         id<MTLComputePipelineState> p_cfwht = mk("col_fwht_and_ss");
         id<MTLComputePipelineState> p_fsc   = mk("finalize_scales");
-        id<MTLComputePipelineState> p_enc   = mk("tfq4_e8p_encode");
+        id<MTLComputePipelineState> p_enc   = mk(use_true_e8p ? "tfq4_true_e8p_encode" : "tfq4_e8p_encode");
         id<MTLCommandQueue> q = [dev newCommandQueue];
 
         fs::create_directories(opt.out_dir);
         tfq4::PwV4E8Tables tbl;
-        tfq4::build_e8p_tables(tbl);
+        if (use_true_e8p) {
+            tfq4::build_true_e8p_tables(tbl);
+        } else {
+            tfq4::build_e8p_tables(tbl);
+            tbl.table_kind = table_kind;
+        }
         {
             std::string tf_path = (fs::path(opt.out_dir) / "pw_v4_e8p_tables.bin").string();
             std::ofstream tf(tf_path, std::ios::binary);
@@ -206,9 +224,10 @@ int main(int argc, char** argv) {
                         [enc setBuffer:b_ss offset:0 atIndex:2];  [enc setBytes:&mp length:sizeof(mp) atIndex:3];
                         [enc dispatchThreadgroups:MTLSizeMake(C, n_br, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
 
+                        Tfq4ScaleParams sp{n_blk, use_true_e8p ? tfq4::TRUE_E8P_BASE_SCALE : 1.0f};
                         [enc setComputePipelineState:p_fsc];
                         [enc setBuffer:b_ss offset:0 atIndex:0]; [enc setBuffer:b_sc offset:0 atIndex:1];
-                        [enc setBytes:&n_blk length:sizeof(n_blk) atIndex:2];
+                        [enc setBytes:&sp length:sizeof(sp) atIndex:2];
                         [enc dispatchThreadgroups:MTLSizeMake(n_blk, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
 
                         [enc setComputePipelineState:p_enc];

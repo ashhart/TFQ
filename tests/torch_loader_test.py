@@ -19,7 +19,8 @@ sys.path.insert(0, os.path.join(REPO_ROOT, "integrations", "pytorch"))
 sys.path.insert(0, os.path.join(REPO_ROOT, "reference"))
 
 import tfq3_reference as tfq3_ref
-from tfq_torch import Tfq3Linear, load_tfq_into_hf
+import tfq4_lattice as tfq4_ref
+from tfq_torch import Tfq3Linear, Tfq4Linear, load_tfq_into_hf
 
 MLP = ("gate_proj", "up_proj", "down_proj")
 
@@ -143,9 +144,55 @@ def test_cpu_decode_matches_reference() -> None:
     print("PASS cpu: Tfq3Linear 3/4/5b CPU decode == tfq3_reference (max err < 1e-4)")
 
 
+def test_tfq4_table_kind_decode() -> None:
+    """Tfq4Linear decodes both PWV4 table_kind=0 (trained) and table_kind=2 (true E8P) identically to tfq4_lattice."""
+    rng = np.random.default_rng(7)
+    W = (rng.standard_normal((256, 256)) * 0.03).astype(np.float32)
+    lut_trained = tfq4_ref.load_pwv4_tables(os.path.join(REPO_ROOT, "reference", "tables", "pw_v4_e8p_tables.bin"))
+    lut_e8p, _ = tfq4_ref.build_true_e8p_abs_codebook()
+    lut_e8p = lut_e8p.astype(np.float32)
+
+    for kind, lut in ((0, lut_trained), (2, lut_e8p)):
+        W_rot = tfq4_ref.fwht2d_128(W)
+        if kind == 2:
+            q_rot, codes, sc = tfq4_ref.quant_true_e8p_e8_quarter(
+                W_rot, abs_cb=lut, base_scale=tfq4_ref.TRUE_E8P_BASE_SCALE, ls_refine=False
+            )
+            ref_w = tfq4_ref.inv_fwht2d_128(q_rot)
+        else:
+            blocks = W_rot.reshape(2, 128, 2, 128).transpose(0, 2, 1, 3)
+            sc = np.sqrt(np.mean(blocks * blocks, axis=(2, 3))).astype(np.float16)
+            sc_tile = np.repeat(np.repeat(sc.astype(np.float32), 128, axis=0), 128, axis=1)
+            W_norm = W_rot / sc_tile
+            v = W_norm.reshape(-1, 8)
+            sgn = np.where(v < 0.0, -1.0, 1.0).astype(np.float32)
+            av = np.abs(v)
+            d2 = np.sum(av * av, axis=1, keepdims=True) + np.sum(lut * lut, axis=1)[None, :] - 2.0 * (av @ lut.T)
+            k_idx = np.argmin(d2, axis=1).astype(np.uint16)
+            sm = np.zeros(v.shape[0], dtype=np.uint16)
+            for d_i in range(8):
+                sm |= (v[:, d_i] < 0.0).astype(np.uint16) << np.uint16(d_i)
+            codes = (k_idx | (sm << np.uint16(8))).reshape(256, 32)
+            q_rot = (lut[k_idx] * sgn).reshape(256, 256) * sc_tile
+            ref_w = tfq4_ref.inv_fwht2d_128(q_rot)
+        c2 = codes.reshape(256, 16, 2).astype(np.uint32)
+        wd = c2[:, :, 0] | (c2[:, :, 1] << np.uint32(16))
+        lin = Tfq4Linear(256, 256, wd, sc, lut, table_kind=kind)
+        w = lin.dequantize(dtype=torch.float32).numpy()
+        err = float(np.max(np.abs(w - ref_w)))
+        assert err < 1e-4, f"TFQ4 table_kind={kind} CPU decode vs reference: {err}"
+    try:
+        Tfq4Linear(256, 256, wd, sc, lut_e8p, table_kind=3)
+        raise AssertionError("Tfq4Linear accepted unsupported table_kind=3")
+    except ValueError:
+        pass
+    print("PASS cpu: Tfq4Linear table_kind=0 and table_kind=2 decode == tfq4_lattice (and rejects kind=3)")
+
+
 if __name__ == "__main__":
     print("datasets importable:", __import__("importlib").util.find_spec("datasets") is not None)
     test_cpu_decode_matches_reference()
+    test_tfq4_table_kind_decode()
     test_complete_checkpoint_loads()
     expect("embed", ["model.embed_tokens.weight"])
     expect("tfpw", [f"model.layers.0.mlp.{p}.weight" for p in MLP])

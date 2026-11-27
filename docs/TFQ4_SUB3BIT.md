@@ -6,17 +6,35 @@ TFQ3 delivers 3-, 4-, and 5-bit data-free vector quantization using a 2D affine-
 
 After TFQ3's exact `2D FWHT-128` tile rotation and single `fp16` tile scale (`128 × 128` -> `0.001 bpw` overhead), rotated weights follow $\mathcal{N}(0, 1)^8$:
 
-- **Packing (`2.000 bpw`):** every 8 weights share a **16-bit code** (`2` codes per `uint32_t` = `16` weights per `uint32_t`):
-  - **Low 8 bits (`abs_idx`):** index into a fixed `256 × 8` `fp16` positive-orthant E8-initialized Voronoi codebook (**`4,096` bytes** — fits entirely in GPU L1 / shared memory on Apple Silicon Metal, NVIDIA CUDA, and AMD ROCm!).
-  - **High 8 bits (`sign_mask`):** 8 independent sign bits applied in a single XOR (`^ ((bit << 15) | (bit << 31))`) directly on packed `half2` lanes — yielding `256 × 256 = 65,536` effective 8D codewords with zero branches and zero runtime state dependence.
+- **Packing (`2.000 bpw`):** every 8 weights share a **16-bit code** (`2` codes per `uint32_t` = `16` weights per `uint32_t`), selected by `PWV4.table_kind` (see [`docs/FORMAT_SPEC.md`](FORMAT_SPEC.md)):
+  - **`table_kind = 0` / `1` (`--table-kind trained`, default):** low 8 bits index a trained `256 × 8` `fp16` positive-orthant Voronoi codebook (**`4,096` bytes**); high 8 bits hold 8 independent sign bits applied via branchless `half2` XOR (`256 × 256 = 65,536` codewords).
+  - **`table_kind = 2` (`--table-kind e8p`, True QuIP# E8P `E8 + 1/4`):** low 8 bits index the 256 smallest-norm half-integer vectors in `|D8 + 1/2|` (exact in `fp16`, `4,096` bytes); bits `8..14` hold 7 free sign bits, sign bit 7 is derived from parity (`popcount(s7) ^ (sum(floor(a)) & 1)`), and bit `15` selects the `±1/4` coset — spanning `65,536` unique points strictly inside the shifted lattice $E_8 + \frac{1}{4}\mathbf{1}$ with an exact $O(256)$ nearest-point encoder on both Apple Silicon Metal and NVIDIA CUDA.
 - **2.25 bpw tier (`16 KiB` LUT):** `1024 × 8` `fp16` magnitude codebook × `256` signs (`262,144` effective 8D codewords).
-- **100% data-free:** codebooks are trained once from synthetic $|\mathcal{N}(0, 1)^8|$ initialized on exact spherical $E_8 + \frac{1}{4}\mathbf{1}$ shells.
+- **100% data-free:** both `kind=0` (trained from synthetic $|\mathcal{N}(0, 1)^8|$) and `kind=2` (exact $E_8 + \frac{1}{4}$ algebraic lattice) require zero calibration data.
 
 ## 2. Measured Quality on Real BF16 Transformer Weights `[MEASURED]`
 
-Reproduce single-layer weight SNR via [`reference/tfq4_lattice.py`](../reference/tfq4_lattice.py) (measured on `1024 × 1024` tiles of real BF16 checkpoints vs. uniform affine baselines), and full-model 16,352-token WikiText-2 perplexity + activation output SNR via [`tools/bench_quantizers.py`](../tools/bench_quantizers.py) (see [`docs/BENCHMARKS.md`](BENCHMARKS.md)):
+Reproduce single-layer weight SNR via [`reference/tfq4_lattice.py`](../reference/tfq4_lattice.py) (measured on `1024 × 1024` tiles of real BF16 checkpoints vs. uniform affine baselines), and full-model WikiText-2 perplexity + exact fp64 full-vocab KL via [`tools/bench_quantizers.py`](../tools/bench_quantizers.py) (see [`docs/BENCHMARKS.md`](BENCHMARKS.md)):
 
-> **Dense 2-bit caveat (`[MEASURED]`):** On a small dense 1.5B model (`Qwen/Qwen2.5-1.5B`, all 196 linear layers quantized to `2.001 bpw`), TFQ4-E8P stays coherent (`PPL 250.17` data-free / `210.09` with Hessian-LDLQ `+2.00 dB` Output SNR) where 2-bit RTN (`36,113`) and 2-bit GPTQ (`695,363`) collapse — but `2.0 bpw` is still severe for a dense 1.5B model and is designed for **cold MoE experts**, not tiny dense models.
+> **Dense 2-bit caveat (`[MEASURED]`):** On a small dense 1.5B model (`Qwen/Qwen2.5-1.5B`, all 196 linear layers quantized to `2.001 bpw`), TFQ4 stays coherent where 2-bit RTN and 2-bit GPTQ collapse, and `table_kind = 2` (true QuIP# E8P) nearly halves data-free PPL vs `table_kind = 0` — but `2.0 bpw` is still severe for a dense 1.5B model and is primarily designed for **cold MoE experts**, not tiny dense models.
+
+### 2.1 Matched `2.001 bpw` Comparison: `PWV4 table_kind = 0` (Trained) vs `table_kind = 2` (True QuIP# E8P `E8 + 1/4`) `[MEASURED]`
+
+Evaluated on `Qwen/Qwen2.5-1.5B` (all 196 transformer linears at `2.001 bpw`, full `145 × 2048 = 296,815`-token WikiText-2 test split, exact fp64 full-vocab KL across all 296,815 tokens, 95% sequence-level bootstrap CIs; Hessian-LDLQ calibrated on `64 × 512` WikiText-2 train):
+
+| Variant (`2.001 bpw`, `4 KiB` LUT) | Weight SNR | Output SNR | WikiText-2 PPL | Paired ΔNLL vs BF16 (95% CI) | Mean KL | KL p99 | Top-1 |
+|---|---:|---:|---:|---|---:|---:|---:|
+| BF16 Gold | — | — | **9.22** | `0.0000` | `0.0000` | `0.0000` | `100.00%` |
+| `PWV4 kind=0` Trained `256×8` (Data-Free) | 10.09 dB | 10.86 dB | 344.19 | `+3.6198 [+3.5689, +3.6749]` | 3.6557 | 11.0220 | 22.46% |
+| **`PWV4 kind=2` True QuIP# E8P (Data-Free, `s=0.97`)** | **10.36 dB** | **11.12 dB** | **176.10** | **`+2.9497 [+2.9118, +2.9868]`** | **2.9820** | **9.4430** | **28.13%** |
+| `PWV4 kind=2` True QuIP# E8P (Data-Free, LS-scale) | 10.37 dB | 11.12 dB | 177.20 | `+2.9559 [+2.9181, +2.9931]` | 2.9883 | 9.4522 | 28.09% |
+| `PWV4 kind=0` Trained `256×8` + Hessian-LDLQ | 8.24 dB | 15.18 dB | 33.62 | `+1.2937 [+1.1832, +1.4100]` | 1.3490 | 7.4729 | 52.38% |
+| **`PWV4 kind=2` True QuIP# E8P + Hessian-LDLQ** | **8.50 dB** | **15.45 dB** | **31.05** | **`+1.2143 [+1.1134, +1.3268]`** | **1.2679** | **7.0537** | **53.77%** |
+
+- On synthetic $\mathcal{N}(0, 1)^8$, `kind=2` achieves **`10.38 dB`** vs `10.11 dB` (`+0.27 dB`), and on real `Qwen2.5-1.5B` cuts data-free PPL by **48.8%** (`344.19 → 176.10`, `-0.670` nats paired ΔNLL) and Hessian-LDLQ PPL by **7.6%** (`33.62 → 31.05`, `-6.0%` mean KL).
+- Use `tfq3 MODEL --bits 2 --table-kind e8p` (or `tfq4-convert` / `tfq4-convert-cuda --table-kind e8p`) to emit `table_kind = 2` checkpoints (100% SHA-256 bit-identical between Metal and CUDA). The default remains `--table-kind trained` (`table_kind = 0`) to preserve backwards compatibility with existing `PWV4` runtime decoders.
+
+### 2.2 Single-Layer Synthetic & Real Weight SNR vs Baselines `[MEASURED]`
 
 | Quantizer | Effective Rate | Synthetic Gaussian SNR | Qwen2.5-1.5B `L0.mlp.down` SNR | Llama-3.1-8B `L15.mlp.down` SNR | Output Cosine (`Y-cos`) |
 |---|---:|---:|---:|---:|---:|

@@ -144,20 +144,30 @@ class XXH64:
         return h
 
 
+try:
+    import xxhash as _xxhash_c  # optional C fast path; pure-Python XXH64 below has zero deps
+except ImportError:
+    _xxhash_c = None
+
+
+def _new_xxh64(seed: int = 0):
+    return _xxhash_c.xxh64(seed=seed) if _xxhash_c is not None else XXH64(seed)
+
+
 def xxh64(data: bytes | bytearray | memoryview, seed: int = 0) -> int:
-    st = XXH64(seed)
+    st = _new_xxh64(seed)
     st.update(data)
     return st.intdigest()
 
 
 def xxh64_sections(sections, seed: int = 0) -> int:
-    st = XXH64(seed)
+    st = _new_xxh64(seed)
     for sec in sections:
         st.update(sec)
     return st.intdigest()
 
 
-def _update_xxh64_file_slice(f, off: int, length: int, st: XXH64) -> None:
+def _update_xxh64_file_slice(f, off: int, length: int, st) -> None:
     if length == 0:
         return
     f.seek(off)
@@ -174,7 +184,7 @@ def verify_tfpn_like_checksum(f, off_meta: int, meta_bytes: int, off_scales: int
                               off_weights: int, w_bytes: int, pad0: int, pad1: int, label: str) -> None:
     if (pad0 & FLAG_XXH64_PRESENT) == 0:
         return
-    st = XXH64(0)
+    st = _new_xxh64(0)
     _update_xxh64_file_slice(f, off_meta, meta_bytes, st)
     _update_xxh64_file_slice(f, off_scales, sc_bytes, st)
     _update_xxh64_file_slice(f, off_weights, w_bytes, st)
@@ -202,7 +212,7 @@ def verify_tfpw_checksum(shard_path: str) -> bool:
             ("scales", off_sc, sh * 2, exp_sc),
             ("weights", off_w, sw * 4, exp_w),
         ):
-            st = XXH64(0)
+            st = _new_xxh64(0)
             _update_xxh64_file_slice(f, off, length, st)
             got = st.intdigest()
             if got != expected:
@@ -339,7 +349,9 @@ def _decode_8_5b(st: int, hi8: int, lo32: int, tbl: dict) -> tuple[int, np.ndarr
     return lo32 & 0xFFFFFFFF, np.concatenate([q0, q1])
 
 
-def dequantize_tfpn_tensor(shard_path: str, tables_path: str, tensor_name: str, max_blocks: int = 1) -> np.ndarray:
+def dequantize_tfpn_tensor(
+    shard_path: str, tables_path: str, tensor_name: str, max_blocks: int = 1, verify_checksum: bool = True
+) -> np.ndarray:
     """Dequantize the top-left [max_blocks*128, max_blocks*128] tiles of a TFPN tensor to float32."""
     tbl = load_tables(tables_path)
     with open(shard_path, "rb") as f:
@@ -347,9 +359,10 @@ def dequantize_tfpn_tensor(shard_path: str, tables_path: str, tensor_name: str, 
         magic, ver, nt, pad0, off_meta, off_scales, off_weights, tot_sc, tot_w, pad1 = hdr
         if magic != MAGIC_TFPN or ver != FORMAT_VER:
             raise ValueError(f"Bad TFPN header in {shard_path}")
-        verify_tfpn_like_checksum(
-            f, off_meta, nt * 128, off_scales, tot_sc * 2, off_weights, tot_w * 4, pad0, pad1, f"TFPN ({shard_path})"
-        )
+        if verify_checksum:
+            verify_tfpn_like_checksum(
+                f, off_meta, nt * 128, off_scales, tot_sc * 2, off_weights, tot_w * 4, pad0, pad1, f"TFPN ({shard_path})"
+            )
         f.seek(off_meta)
         found = None
         for _ in range(nt):
@@ -616,7 +629,13 @@ def self_test() -> None:
     ):
         got_one = xxh64(sbuf[:n], 0)
         got_stream = xxh64_sections((sbuf[: n // 3], sbuf[n // 3 : (2 * n) // 3], sbuf[(2 * n) // 3 : n]), 0)
-        assert got_one == expected and got_stream == expected, f"XXH64 len={n}: {got_one:#x} vs {expected:#x}"
+        st_py = XXH64(0)
+        st_py.update(sbuf[: n // 3])
+        st_py.update(sbuf[n // 3 : (2 * n) // 3])
+        st_py.update(sbuf[(2 * n) // 3 : n])
+        assert got_one == expected and got_stream == expected and st_py.intdigest() == expected, (
+            f"XXH64 len={n}: {got_one:#x} vs {expected:#x}"
+        )
     print(f"PASS 2D FWHT-128 exact invertibility: max_err={max_err:.2e}")
     print(f"PASS Outlier flattening (kurtosis):   before={kurt_before:.1f} -> after={kurt_after:.2f} (Gaussian=3.0)")
     print("PASS XXH64 reference vectors (one-shot & streaming)")

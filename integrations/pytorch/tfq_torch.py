@@ -141,6 +141,7 @@ class Tfq4Linear(nn.Module):
         e8p_lut: np.ndarray,
         bias: torch.Tensor | None = None,
         cache_decoded: bool = False,
+        table_kind: int = 0,
     ) -> None:
         super().__init__()
         self.in_features = in_features
@@ -148,6 +149,13 @@ class Tfq4Linear(nn.Module):
         self.pad_r = ((out_features + 127) // 128) * 128
         self.pad_c = ((in_features + 127) // 128) * 128
         self.cache_decoded = cache_decoded
+        self.table_kind = int(table_kind)
+        if self.table_kind not in (
+            tfq4_ref.PWV4_TABLE_LEGACY_TRAINED,
+            tfq4_ref.PWV4_TABLE_TRAINED,
+            tfq4_ref.PWV4_TABLE_TRUE_E8P,
+        ):
+            raise ValueError(f"Unsupported PWV4 table_kind={self.table_kind} (expected 0, 1, or 2)")
         self._e8p_lut = e8p_lut.astype(np.float32)
         self._cached_w: torch.Tensor | None = None
 
@@ -164,11 +172,14 @@ class Tfq4Linear(nn.Module):
         codes = np.empty((self.pad_r, self.pad_c // 8), dtype=np.uint16)
         codes[:, 0::2] = (wd & np.uint32(0xFFFF)).astype(np.uint16)
         codes[:, 1::2] = (wd >> np.uint32(16)).astype(np.uint16)
-        k_idx = (codes & np.uint16(0xFF)).astype(np.int32)
-        sm = (codes >> np.uint16(8)).astype(np.uint32)
-        bits_mask = (sm[..., None] >> np.arange(8, dtype=np.uint32)) & np.uint32(1)
-        sgn = np.where(bits_mask != 0, -1.0, 1.0).astype(np.float32)
-        W_rot = (self._e8p_lut[k_idx] * sgn).reshape(self.pad_r, self.pad_c)
+        if self.table_kind == tfq4_ref.PWV4_TABLE_TRUE_E8P:
+            W_rot = tfq4_ref.decode_true_e8p_codes(codes, self._e8p_lut).reshape(self.pad_r, self.pad_c)
+        else:
+            k_idx = (codes & np.uint16(0xFF)).astype(np.int32)
+            sm = (codes >> np.uint16(8)).astype(np.uint32)
+            bits_mask = (sm[..., None] >> np.arange(8, dtype=np.uint32)) & np.uint32(1)
+            sgn = np.where(bits_mask != 0, -1.0, 1.0).astype(np.float32)
+            W_rot = (self._e8p_lut[k_idx] * sgn).reshape(self.pad_r, self.pad_c)
         sc_tile = np.repeat(np.repeat(sc, 128, axis=0), 128, axis=1)
         W_hat = tfq4_ref.inv_fwht2d_128(W_rot * sc_tile)[: self.out_features, : self.in_features]
         return torch.from_numpy(W_hat).to(device=self.words_i32.device, dtype=dtype)
@@ -290,7 +301,7 @@ def load_tfq_into_hf(
         skipped += [f"{os.path.basename(sp)}: TFQ4 shard in a TFQ3 directory (mixed TFQ3+TFQ4 is not supported)"
                     for sp in sorted(glob.glob(os.path.join(tfq_dir, "*.tffp4")))]
     elif os.path.isfile(pw4):
-        lut4 = tfq4_ref.load_pwv4_tables(pw4)
+        lut4, kind4 = tfq4_ref.load_pwv4_tables_with_kind(pw4)
         for sp in sorted(glob.glob(os.path.join(tfq_dir, "*.tffp4"))):
             with open(sp, "rb") as f:
                 hdr = struct.unpack("<IIIIQQQQQQ", f.read(64))
@@ -317,7 +328,7 @@ def load_tfq_into_hf(
                     bias = res_state.get(f"{nm}.bias", old_mod.bias if old_mod.bias is not None else None)
                     _set_submodule(
                         model, nm,
-                        Tfq4Linear(orig_c, orig_r, wd, sc, lut4, bias=bias, cache_decoded=cache_decoded),
+                        Tfq4Linear(orig_c, orig_r, wd, sc, lut4, bias=bias, cache_decoded=cache_decoded, table_kind=kind4),
                     )
 
     if missing:

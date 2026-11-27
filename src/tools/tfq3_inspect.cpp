@@ -343,6 +343,29 @@ static bool inspect_tfpw(const std::string& path) {
     return true;
 }
 
+static float f16_to_f32_local(uint16_t h) {
+    uint32_t sign = (uint32_t)(h & 0x8000u) << 16;
+    uint32_t exp  = (h >> 10) & 0x1Fu;
+    uint32_t mant = h & 0x3FFu;
+    uint32_t out;
+    if (exp == 0u) {
+        if (mant == 0u) out = sign;
+        else {
+            int e = -14;
+            while ((mant & 0x400u) == 0u) { mant <<= 1; --e; }
+            mant &= 0x3FFu;
+            out = sign | ((uint32_t)(e + 127) << 23) | (mant << 13);
+        }
+    } else if (exp == 31u) {
+        out = sign | 0x7F800000u | (mant << 13);
+    } else {
+        out = sign | ((exp - 15u + 127u) << 23) | (mant << 13);
+    }
+    float f;
+    std::memcpy(&f, &out, 4);
+    return f;
+}
+
 static bool inspect_pwv4(const std::string& path) {
     uint64_t sz = file_size(path);
     if (sz != 16384ULL) {
@@ -356,10 +379,16 @@ static bool inspect_pwv4(const std::string& path) {
     fclose(f);
     if (!ok) { fprintf(stderr, "FAIL %s: short read\n", path.c_str()); return false; }
 
-    uint32_t hdr[4];
-    std::memcpy(hdr, buf, 16);
+    uint32_t hdr[5];
+    std::memcpy(hdr, buf, 20);
     if (hdr[0] != MAGIC_PWV4 || hdr[1] != TFQ4_VER || hdr[2] != 256u || hdr[3] != 8u) {
         fprintf(stderr, "FAIL %s: bad PWV4 header\n", path.c_str());
+        return false;
+    }
+    const uint32_t table_kind = hdr[4];
+    if (table_kind > 2u) {
+        fprintf(stderr, "FAIL %s: unknown PWV4 table_kind %u (supported: 0/1=trained, 2=true-E8P)\n",
+                path.c_str(), table_kind);
         return false;
     }
     for (size_t i = 0; i < 256u * 8u; ++i) {
@@ -369,8 +398,20 @@ static bool inspect_pwv4(const std::string& path) {
             fprintf(stderr, "FAIL %s: invalid PWV4 e8p_lut entry [%zu][%zu] (0x%04x)\n", path.c_str(), i / 8, i % 8, h);
             return false;
         }
+        if (table_kind == 2u) {
+            float v = f16_to_f32_local(h);
+            float two_v = v * 2.0f;
+            float r = std::round(two_v);
+            if (v < 0.5f || std::fabs(two_v - r) > 1e-3f || (((int)r) & 1) == 0) {
+                fprintf(stderr, "FAIL %s: invalid true-E8P half-integer LUT entry [%zu][%zu] (%g)\n",
+                        path.c_str(), i / 8, i % 8, v);
+                return false;
+            }
+        }
     }
-    printf("OK   %-42s PWV4 v%u | 16384 bytes | E8P %ux%uD (4 KiB LUT)\n", path.c_str(), hdr[1], hdr[2], hdr[3]);
+    const char* kind_lbl = (table_kind == 2u) ? "true-E8P (E8+1/4)" : "trained-256x8";
+    printf("OK   %-42s PWV4 v%u | 16384 bytes | kind=%u (%s) %ux%uD (4 KiB LUT)\n",
+           path.c_str(), hdr[1], table_kind, kind_lbl, hdr[2], hdr[3]);
     return true;
 }
 

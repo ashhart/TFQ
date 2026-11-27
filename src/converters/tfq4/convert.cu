@@ -81,14 +81,14 @@ __global__ void col_fwht_ss_k(
     if (lane == 0) col_ss[(uint64_t)bi * 128u + (c & 127u)] = ss;
 }
 
-__global__ void finalize_scales_k(const float* __restrict__ col_ss, __half* __restrict__ sc, uint32_t n_blk) {
+__global__ void finalize_scales_k(const float* __restrict__ col_ss, __half* __restrict__ sc, uint32_t n_blk, float scale_mult) {
     uint32_t bi = blockIdx.x, lane = threadIdx.x;
     if (bi >= n_blk) return;
     const float* cs = col_ss + (uint64_t)bi * 128u;
     float s = (cs[lane + 0u] + cs[lane + 32u]) + (cs[lane + 64u] + cs[lane + 96u]);
     #pragma unroll
     for (int d = 16; d >= 1; d >>= 1) s += __shfl_xor_sync(0xFFFFFFFFu, s, d);
-    if (lane == 0) sc[bi] = __float2half_rn(sqrtf(s * (1.0f / 16384.0f) + 1e-12f));
+    if (lane == 0) sc[bi] = __float2half_rn(sqrtf(s * (1.0f / 16384.0f) + 1e-12f) * scale_mult);
 }
 
 __global__ void tfq4_e8p_encode_k(
@@ -167,6 +167,132 @@ __global__ void tfq4_e8p_encode_k(
     }
 }
 
+__global__ void tfq4_true_e8p_encode_k(
+    const float* __restrict__ W_rot, const __half* __restrict__ scales,
+    const __half* __restrict__ e8p_lut, uint32_t* __restrict__ out_words,
+    float* __restrict__ metrics, uint32_t R, uint32_t C
+) {
+    __shared__ float sm_lut[256][8];
+    __shared__ float sm_n2[256];
+    __shared__ uint32_t sm_par[256];
+    uint32_t tid = threadIdx.x;
+    {
+        float a0 = __half2float(e8p_lut[tid * 8u + 0u]);
+        float a1 = __half2float(e8p_lut[tid * 8u + 1u]);
+        float a2 = __half2float(e8p_lut[tid * 8u + 2u]);
+        float a3 = __half2float(e8p_lut[tid * 8u + 3u]);
+        float a4 = __half2float(e8p_lut[tid * 8u + 4u]);
+        float a5 = __half2float(e8p_lut[tid * 8u + 5u]);
+        float a6 = __half2float(e8p_lut[tid * 8u + 6u]);
+        float a7 = __half2float(e8p_lut[tid * 8u + 7u]);
+        sm_lut[tid][0] = a0; sm_lut[tid][1] = a1; sm_lut[tid][2] = a2; sm_lut[tid][3] = a3;
+        sm_lut[tid][4] = a4; sm_lut[tid][5] = a5; sm_lut[tid][6] = a6; sm_lut[tid][7] = a7;
+        sm_n2[tid] = ((a0 * a0 + a1 * a1) + (a2 * a2 + a3 * a3))
+                   + ((a4 * a4 + a5 * a5) + (a6 * a6 + a7 * a7));
+        sm_par[tid] = ((uint32_t)(int)a0 + (uint32_t)(int)a1 + (uint32_t)(int)a2 + (uint32_t)(int)a3
+                     + (uint32_t)(int)a4 + (uint32_t)(int)a5 + (uint32_t)(int)a6 + (uint32_t)(int)a7) & 1u;
+    }
+    __syncthreads();
+
+    uint64_t gtid = (uint64_t)blockIdx.x * blockDim.x + tid;
+    uint32_t wpr = C >> 4;
+    uint64_t total_words = (uint64_t)R * wpr;
+    float my_sig = 0.0f, my_err = 0.0f;
+
+    if (gtid < total_words) {
+        uint32_t r = (uint32_t)(gtid / wpr), wc = (uint32_t)(gtid - (uint64_t)r * wpr);
+        uint32_t n_bc = C >> 7;
+        float sc = __half2float(scales[(r >> 7) * n_bc + (wc >> 3)]);
+        float inv_sc = (sc > 0.0f) ? (1.0f / sc) : 0.0f;
+        const float* src = W_rot + (uint64_t)r * C + (uint64_t)wc * 16ull;
+
+        uint32_t codes[2];
+        #pragma unroll
+        for (uint32_t h = 0u; h < 2u; ++h) {
+            float x[8], v[8];
+            #pragma unroll
+            for (uint32_t d = 0u; d < 8u; ++d) {
+                float xd = src[h * 8u + d];
+                x[d] = xd;
+                v[d] = xd * inv_sc;
+                my_sig += xd * xd;
+            }
+            float best_d = 1e30f;
+            uint32_t best_coset = 0u, best_k = 0u, best_nb = 0u;
+
+            #pragma unroll
+            for (uint32_t coset = 0u; coset < 2u; ++coset) {
+                float z[8], az[8];
+                uint32_t nb = 0u;
+                #pragma unroll
+                for (uint32_t d = 0u; d < 8u; ++d) {
+                    float zd = ((coset == 0u) ? v[d] : -v[d]) + 0.25f;
+                    z[d] = zd;
+                    if (zd < 0.0f) nb |= (1u << d);
+                    az[d] = fabsf(zd);
+                }
+                uint32_t z_par = (uint32_t)__popc(nb) & 1u;
+                float z_n2 = ((z[0] * z[0] + z[1] * z[1]) + (z[2] * z[2] + z[3] * z[3]))
+                           + ((z[4] * z[4] + z[5] * z[5]) + (z[6] * z[6] + z[7] * z[7]));
+
+                for (uint32_t k = 0u; k < 256u; ++k) {
+                    float p0 = az[0] * sm_lut[k][0], p1 = az[1] * sm_lut[k][1];
+                    float p2 = az[2] * sm_lut[k][2], p3 = az[3] * sm_lut[k][3];
+                    float p4 = az[4] * sm_lut[k][4], p5 = az[5] * sm_lut[k][5];
+                    float p6 = az[6] * sm_lut[k][6], p7 = az[7] * sm_lut[k][7];
+                    float dot = ((p0 + p1) + (p2 + p3)) + ((p4 + p5) + (p6 + p7));
+                    float min_p = p0; uint32_t min_d = 0u;
+                    if (p1 < min_p) { min_p = p1; min_d = 1u; }
+                    if (p2 < min_p) { min_p = p2; min_d = 2u; }
+                    if (p3 < min_p) { min_p = p3; min_d = 3u; }
+                    if (p4 < min_p) { min_p = p4; min_d = 4u; }
+                    if (p5 < min_p) { min_p = p5; min_d = 5u; }
+                    if (p6 < min_p) { min_p = p6; min_d = 6u; }
+                    if (p7 < min_p) { min_p = p7; min_d = 7u; }
+                    bool flip = (z_par != sm_par[k]);
+                    float adj = flip ? (dot - 2.0f * min_p) : dot;
+                    float dist = (z_n2 + sm_n2[k]) - 2.0f * adj;
+                    if (dist < best_d) {
+                        best_d = dist;
+                        best_coset = coset;
+                        best_k = k;
+                        best_nb = flip ? (nb ^ (1u << min_d)) : nb;
+                    }
+                }
+            }
+            codes[h] = (best_coset << 15) | ((best_nb & 0x7Fu) << 8) | best_k;
+            #pragma unroll
+            for (uint32_t d = 0u; d < 8u; ++d) {
+                float sgn = ((best_nb >> d) & 1u) ? -1.0f : 1.0f;
+                float q = sgn * sm_lut[best_k][d] - 0.25f;
+                if (best_coset != 0u) q = -q;
+                float e = x[d] - q * sc;
+                my_err += e * e;
+            }
+        }
+        out_words[gtid] = codes[0] | (codes[1] << 16);
+    }
+
+    #pragma unroll
+    for (int d = 16; d >= 1; d >>= 1) {
+        my_sig += __shfl_xor_sync(0xFFFFFFFFu, my_sig, d);
+        my_err += __shfl_xor_sync(0xFFFFFFFFu, my_err, d);
+    }
+    __shared__ float sm_sig[8], sm_err[8];
+    if ((tid & 31u) == 0u) {
+        sm_sig[tid >> 5] = my_sig;
+        sm_err[tid >> 5] = my_err;
+    }
+    __syncthreads();
+    if (tid == 0u) {
+        float bs = 0.0f, be = 0.0f;
+        #pragma unroll
+        for (int w = 0; w < 8; ++w) { bs += sm_sig[w]; be += sm_err[w]; }
+        metrics[(uint64_t)blockIdx.x * 2ull + 0ull] = bs;
+        metrics[(uint64_t)blockIdx.x * 2ull + 1ull] = be;
+    }
+}
+
 static std::vector<std::vector<size_t>> partition_tfq4_shards(
     const std::vector<tfq_generic::QuantJob>& jobs, uint64_t max_shard_bytes
 ) {
@@ -192,6 +318,7 @@ int main(int argc, char** argv) {
     opt.default_bits = 3;
     opt.head_bits = 0;
     double max_shard_gib = 3.4;
+    uint32_t table_kind = tfq4::PWV4_TABLE_LEGACY_TRAINED;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if ((a == "--model" || a == "-m") && i + 1 < argc) opt.model_dir = argv[++i];
@@ -201,14 +328,24 @@ int main(int argc, char** argv) {
         else if (a == "--quantize-embed") opt.quantize_embed = true;
         else if (a == "--head-bits" && i + 1 < argc) opt.head_bits = (uint32_t)std::stoul(argv[++i]);
         else if (a == "--max-shard-gib" && i + 1 < argc) max_shard_gib = std::stod(argv[++i]);
+        else if (a == "--table-kind" && i + 1 < argc) {
+            std::string k = argv[++i];
+            if (k == "trained" || k == "0") table_kind = tfq4::PWV4_TABLE_LEGACY_TRAINED;
+            else if (k == "1") table_kind = tfq4::PWV4_TABLE_TRAINED;
+            else if (k == "e8p" || k == "true-e8p" || k == "2") table_kind = tfq4::PWV4_TABLE_TRUE_E8P;
+            else {
+                fprintf(stderr, "tfq4-convert-cuda: invalid --table-kind '%s' (expected trained|e8p|0|1|2)\n", k.c_str());
+                return 2;
+            }
+        }
         else if (a == "--dry-run") opt.dry_run = true;
         else if (a == "-h" || a == "--help") {
-            printf("Usage: tfq4-convert-cuda --model DIR --out DIR [--head-bits 0|2] [--max-shard-gib 3.4] [--quantize-vision] [--quantize-drafter] [--quantize-embed] [--dry-run]\n");
+            printf("Usage: tfq4-convert-cuda --model DIR --out DIR [--head-bits 0|2] [--table-kind trained|e8p] [--max-shard-gib 3.4] [--quantize-vision] [--quantize-drafter] [--quantize-embed] [--dry-run]\n");
             return 0;
         }
     }
     if (opt.model_dir.empty() || opt.out_dir.empty()) {
-        fprintf(stderr, "Usage: tfq4-convert-cuda --model DIR --out DIR [--head-bits 0|2] [--max-shard-gib 3.4] [--quantize-vision] [--quantize-drafter] [--quantize-embed] [--dry-run]\n");
+        fprintf(stderr, "Usage: tfq4-convert-cuda --model DIR --out DIR [--head-bits 0|2] [--table-kind trained|e8p] [--max-shard-gib 3.4] [--quantize-vision] [--quantize-drafter] [--quantize-embed] [--dry-run]\n");
         return 2;
     }
     if (opt.head_bits != 0u && opt.head_bits != 2u) {
@@ -236,10 +373,16 @@ int main(int argc, char** argv) {
            (est_tfq4_bytes + plan.residual_bytes) / (double)(1ULL << 30));
     if (opt.dry_run) return 0;
 
+    const bool use_true_e8p = (table_kind == tfq4::PWV4_TABLE_TRUE_E8P);
     auto t_start = std::chrono::steady_clock::now();
     fs::create_directories(opt.out_dir);
     tfq4::PwV4E8Tables tbl;
-    tfq4::build_e8p_tables(tbl);
+    if (use_true_e8p) {
+        tfq4::build_true_e8p_tables(tbl);
+    } else {
+        tfq4::build_e8p_tables(tbl);
+        tbl.table_kind = table_kind;
+    }
     {
         std::string tf_path = (fs::path(opt.out_dir) / "pw_v4_e8p_tables.bin").string();
         std::ofstream tf(tf_path, std::ios::binary);
@@ -313,8 +456,12 @@ int main(int argc, char** argv) {
 
                 f32_row_fwht_k<<<dim3(n_bc, rc), 32>>>(d_in, d_tmp, rc, C);
                 col_fwht_ss_k<<<dim3(C, n_br), 32>>>(d_tmp, d_rot, d_ss, rc, C, r0);
-                finalize_scales_k<<<n_blk, 32>>>(d_ss, d_sc, n_blk);
-                tfq4_e8p_encode_k<<<n_mblk, 256>>>(d_rot, d_sc, d_lut, d_out, d_met, rc, C);
+                finalize_scales_k<<<n_blk, 32>>>(d_ss, d_sc, n_blk, use_true_e8p ? tfq4::TRUE_E8P_BASE_SCALE : 1.0f);
+                if (use_true_e8p) {
+                    tfq4_true_e8p_encode_k<<<n_mblk, 256>>>(d_rot, d_sc, d_lut, d_out, d_met, rc, C);
+                } else {
+                    tfq4_e8p_encode_k<<<n_mblk, 256>>>(d_rot, d_sc, d_lut, d_out, d_met, rc, C);
+                }
                 CUDA_CHECK(cudaDeviceSynchronize());
 
                 std::vector<float> h_met((size_t)n_mblk * 2u);

@@ -185,13 +185,25 @@ Any compliant reader (and `build/tfq3-inspect`) enforces:
 `TFQ4` shares `TFQ3`'s exact `2D FWHT-128` rotation (`SEED_COL = 0x12345678`, `SEED_ROW = 0x9E3779B9`) and `128 × 128` `fp16` tile scale grid (`0.001 bpw` overhead), allowing hybrid `TFQ3` (`3/4/5b`) + `TFQ4` (`2.0b`) checkpoints to share one input rotation and one inverse row-FWHT epilogue:
 
 - **`pw_v4_e8p_tables.bin` (`PWV4`, fixed 16,384 bytes):**
-  - Header (`64` bytes): `magic = 0x34565750` (`"PWV4"`), `version = 4`, `k_codes = 256`, `dim = 8`, `pad0[12]`.
-  - Offset `64..4160`: `e8p_lut[256][8]` (`fp16`, **`4,096` bytes**) — deterministic positive-orthant 8D E8-initialized Voronoi codebook.
-  - **Canonical table SHA-256 (`reference/tables/pw_v4_e8p_tables.bin`):**
+  - Header (`64` bytes):
+    - `magic = 0x34565750` (`"PWV4"`) at offset `0` (`u32`)
+    - `version = 4` at offset `4` (`u32`)
+    - `k_codes = 256` at offset `8` (`u32`)
+    - `dim = 8` at offset `12` (`u32`)
+    - `table_kind` (`pad0[0]`) at offset `16` (`u32`):
+      - `0` — legacy/default trained `256 × 8` magnitude codebook with 8 independent sign bits (`65,536` codewords).
+      - `1` — explicit alias for the trained `256 × 8` codebook (identical decode rule to `0`).
+      - `2` — **true QuIP# E8P (`E8 + 1/4`)** lattice codebook: `256 × 8` half-integer `|D8 + 1/2|` magnitude table (exact in `fp16`), 7 free sign bits + 1 derived sign-parity bit + 1 coset bit (`±1/4` shift), giving `65,536` unique points strictly inside `E8 + 1/4`.
+      - `> 2` — **unknown; compliant readers MUST reject.**
+    - `pad0[1..11]` at offsets `20..63` (`u32[11]`, zero).
+  - Offset `64..4160`: `e8p_lut[256][8]` (`fp16`, **`4,096` bytes**) — non-negative magnitude codebook selected by `table_kind`.
+  - **Canonical table SHA-256 (`reference/tables/pw_v4_e8p_tables.bin`, `table_kind = 0`):**
     `ddf28171bd5ea33e2cddc560b5543f6890f2a179bb6dce7082a66243c04b7405`
+  - **Canonical true-E8P table SHA-256 (`--table-kind e8p`, `table_kind = 2`):**
+    `f1698d7e01bb0261f6b637c1a02b6965c7b21e6226c9790a5201283f44bf27e2`
 - **`*.tffp4` (`TFP4`, 16 KiB-aligned):**
-  - Identical 64-byte header (`magic = 0x34504654`, `version = 4`) and 128-byte tensor metadata (`b_bits = 2`, `word_count = R * (C / 16)`, `pad = [orig_R, orig_C, flags]`) as `TFPN`.
-  - Row-major packed `uint32_t[R, C / 16]`: each `uint32_t` holds two 16-bit codes `(sign_mask << 8) | abs_idx` (`c0 = w & 0xFFFF`, `c1 = w >> 16`), decoding 16 rotated weights via branchless `half2` sign XOR against `e8p_lut[abs_idx]`.
+  - Identical 64-byte header (`magic = 0x34504654`, `version = 4`, with the same `pad0`/`pad1` XXH64 checksum contract as `TFPN`) and 128-byte tensor metadata (`b_bits = 2`, `word_count = R * (C / 16)`, `pad = [orig_R, orig_C, flags]`) as `TFPN`.
+  - Row-major packed `uint32_t[R, C / 16]`: each `uint32_t` holds two 16-bit codes (`c0 = w & 0xFFFF`, `c1 = w >> 16`), decoded per `PWV4.table_kind` (§6.4).
 
 ---
 
@@ -370,18 +382,39 @@ Because `new_st = lo32` and subtile `k = 3` of half `h = 1` has `lo32 = w4`, the
 
 ### 6.4 TFQ4 (`2.001 bpw`) Decode Pseudo-Code
 
-TFQ4 stores row-major `words[R, C / 16]` (`u32`) and block scales `scales[R / 128, C / 128]` (`fp16`) using `e8p_lut[256, 8]` (`fp16`, non-negative):
+TFQ4 stores row-major `words[R, C / 16]` (`u32`) and block scales `scales[R / 128, C / 128]` (`fp16`) using `e8p_lut[256, 8]` (`fp16`, non-negative) and `table_kind` from `pw_v4_e8p_tables.bin`:
 
 ```python
-def decode_16_tfq4(w: u32, e8p_lut: f32[256, 8]) -> f32[16]:
+def decode_16_tfq4(w: u32, e8p_lut: f32[256, 8], table_kind: u32 = 0) -> f32[16]:
     out = [0.0] * 16
-    for half_idx, code in enumerate((w & 0xFFFF, w >> 16)):
-        abs_idx   = code & 0xFF
-        sign_mask = code >> 8
-        for d in range(8):
-            sgn = -1.0 if ((sign_mask >> d) & 1) else 1.0
-            out[half_idx * 8 + d] = e8p_lut[abs_idx][d] * sgn
+    if table_kind in (0, 1):
+        # Trained 256x8 magnitude codebook + 8 independent sign bits
+        for half_idx, code in enumerate((w & 0xFFFF, w >> 16)):
+            abs_idx   = code & 0xFF
+            sign_mask = code >> 8
+            for d in range(8):
+                sgn = -1.0 if ((sign_mask >> d) & 1) else 1.0
+                out[half_idx * 8 + d] = e8p_lut[abs_idx][d] * sgn
+    elif table_kind == 2:
+        # True QuIP# E8P (E8 + 1/4):
+        #   bits [0..7]  : abs_idx in |D8 + 1/2| (exact half-integers in fp16)
+        #   bits [8..14] : s7 (7 independent sign bits for dims 0..6)
+        #   bit  [15]    : coset (0 -> d - 1/4, 1 -> -(d - 1/4))
+        #   sign bit 7   : popcount(s7) ^ (sum(floor(e8p_lut[abs_idx])) & 1)
+        for half_idx, code in enumerate((w & 0xFFFF, w >> 16)):
+            abs_idx = code & 0xFF
+            s7      = (code >> 8) & 0x7F
+            coset   = (code >> 15) & 1
+            a       = e8p_lut[abs_idx]
+            p_abs   = sum(int(math.floor(x)) for x in a) & 1
+            s_full  = s7 | (((bin(s7).count("1") ^ p_abs) & 1) << 7)
+            for d in range(8):
+                sgn = -1.0 if ((s_full >> d) & 1) else 1.0
+                v = a[d] * sgn - 0.25
+                out[half_idx * 8 + d] = -v if coset else v
+    else:
+        raise ValueError(f"Unsupported PWV4 table_kind={table_kind}")
     return out
 ```
 
-For each row `r ∈ [0..R)` and word column `wc ∈ [0..C/16)`, write `W_rot[r, wc*16 : wc*16 + 16] = decode_16_tfq4(words[r, wc], e8p_lut) * f32(scales[r // 128, wc // 8])`, then apply the same `128 × 128` tile inverse `2D FWHT-128` (§6.1) with `r_off = rb * 128, c_off = bc * 128`.
+For each row `r ∈ [0..R)` and word column `wc ∈ [0..C/16)`, write `W_rot[r, wc*16 : wc*16 + 16] = decode_16_tfq4(words[r, wc], e8p_lut, table_kind) * f32(scales[r // 128, wc // 8])`, then apply the same `128 × 128` tile inverse `2D FWHT-128` (§6.1) with `r_off = rb * 128, c_off = bc * 128`.

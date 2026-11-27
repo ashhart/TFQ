@@ -27,6 +27,7 @@ Options:
   --quantize-vision          Also quantize vision tower linears (generic converter)
   --quantize-drafter         Quantize standalone DFlash2 / DSpine drafter checkpoint
   --quantize-embed           Also quantize embed_tokens table (generic converter)
+  --table-kind KIND          TFQ4 (--bits 2) codebook: trained (default, kind=0) | e8p (true QuIP# E8+1/4, kind=2)
   --max-shard-gib GB         Max TFQ4 shard size in GiB (default: 3.4)
   --trace FILE               Optional trace-guided HeatAlloc routing counts (uses calibration counts)
   --glm-mode MODE            GLM deep-layer MoE bit mode: heat43 (3.33 bpw) | uniform4 (4.00 bpw)
@@ -314,6 +315,7 @@ run_convert() {
     local quantize_vision=0
     local quantize_drafter=0
     local quantize_embed=0
+    local table_kind=""
     local max_shard_gib=""
     local trace_file=""
     local glm_mode="heat43"
@@ -339,6 +341,7 @@ run_convert() {
             --quantize-vision) quantize_vision=1; shift ;;
             --quantize-drafter) quantize_drafter=1; shift ;;
             --quantize-embed) quantize_embed=1; shift ;;
+            --table-kind) [ $# -ge 2 ] || die "--table-kind requires trained|e8p"; table_kind="$2"; shift 2 ;;
             --max-shard-gib) [ $# -ge 2 ] || die "--max-shard-gib requires GB"; max_shard_gib="$2"; shift 2 ;;
             --trace) [ $# -ge 2 ] || die "--trace requires a file path"; trace_file="$2"; shift 2 ;;
             --glm-mode) [ $# -ge 2 ] || die "--glm-mode requires heat43|uniform4"; glm_mode="$2"; shift 2 ;;
@@ -435,6 +438,7 @@ run_convert() {
                 local conv_bin
                 conv_bin="$(require_tool "$lib_dir" "tfq4-convert${suffix}")"
                 local g_flags=(--model "$src_dir" --out "$out_dir" --head-bits "$tfq4_head_bits")
+                [ -n "$table_kind" ] && g_flags+=(--table-kind "$table_kind")
                 [ -n "$max_shard_gib" ] && g_flags+=(--max-shard-gib "$max_shard_gib")
                 [ "$quantize_vision" -eq 1 ] && g_flags+=(--quantize-vision)
                 [ "$quantize_drafter" -eq 1 ] && g_flags+=(--quantize-drafter)

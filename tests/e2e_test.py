@@ -47,6 +47,11 @@ GOLDEN_TFQ4_SHARD_SHA256 = {
     "tfq4-00001-of-00002.tffp4": "1199a6fa0d2077b88010b632ef99ff7dcfe24e1d2668e1bbf379486c804a45d8",
     "tfq4-00002-of-00002.tffp4": "328455b58dc93c2c7b69d0657ba4c69ac2b1d6d75e4e525cab87dab259c29de7",
 }
+GOLDEN_PWV4_TRUE_E8P_SHA256 = "f1698d7e01bb0261f6b637c1a02b6965c7b21e6226c9790a5201283f44bf27e2"
+GOLDEN_TFQ4_TRUE_E8P_SHARD_SHA256 = {
+    "tfq4-00001-of-00002.tffp4": "d4d953a6be48072ae3559d06c22e510b31e3038359d48b55bd2c8e9a7fc8bf6e",
+    "tfq4-00002-of-00002.tffp4": "619816f12465a88656cc10a465e5fde047bf57b6afb6475bab2cd9f6d6b116fb",
+}
 
 
 def sha256_file(path: str) -> str:
@@ -476,6 +481,22 @@ def test_gpu_roundtrips(tfq3_cli: str, inspect_bin: str, model_dir: str, refs: d
         f"PASS TFQ4-E8P 2b GPU round-trip: {len(mf4['tfq_shards'])} shards, "
         f"padded={snr4_pad:.2f} dB, chunk0={s0:.2f} dB, chunk1(r>=4096)={s1:.2f} dB"
     )
+
+    # 3b. TFQ4 True QuIP# E8P (--bits 2 --table-kind e8p, PWV4 table_kind=2) cross-platform GPU round-trip
+    out_tfq4_e8p = os.path.join(tmp, "out_tfq4_e8p")
+    run([tfq3_cli, model_dir, "--bits", "2", "--table-kind", "e8p", "--max-shard-gib", "0.001", "--out", out_tfq4_e8p])
+    run([inspect_bin, "-v", out_tfq4_e8p])
+    tbl4_e8p = os.path.join(out_tfq4_e8p, "pw_v4_e8p_tables.bin")
+    assert sha256_file(tbl4_e8p) == GOLDEN_PWV4_TRUE_E8P_SHA256, "PWV4 table_kind=2 SHA-256 mismatch"
+    for fn, exp_sha in GOLDEN_TFQ4_TRUE_E8P_SHARD_SHA256.items():
+        got_e8p = sha256_file(os.path.join(out_tfq4_e8p, fn))
+        assert got_e8p == exp_sha, f"TFQ4 true-E8P {fn} cross-platform SHA-256 mismatch: got {got_e8p}, expected {exp_sha}"
+    sh_e8p = find_shard_for_tensor(out_tfq4_e8p, ".tffp4", "model.layers.0.mlp.gate_proj")
+    W4_e8p = tfq4_ref.dequantize_tfp4_tensor(sh_e8p, tbl4_e8p, "model.layers.0.mlp.gate_proj")
+    s_e8p_0 = tfq4_ref.snr_db(refs["model.layers.0.mlp.gate_proj"][:4096, :], W4_e8p[:4096, :])
+    s_e8p_1 = tfq4_ref.snr_db(refs["model.layers.0.mlp.gate_proj"][4096:, :], W4_e8p[4096:, :])
+    assert s_e8p_0 > 10.2 and s_e8p_1 > 10.2, f"True-E8P chunked SNR too low: c0={s_e8p_0:.2f}, c1={s_e8p_1:.2f}"
+    print(f"PASS TFQ4 True QuIP# E8P (table_kind=2) GPU round-trip: Metal==CUDA SHA-256 verified, chunk0={s_e8p_0:.2f} dB, chunk1={s_e8p_1:.2f} dB")
 
     # 4. Bit-reproducibility check (Issue #2): repeated runs must produce byte-identical shards & manifests
     def assert_dirs_byte_identical(dir_a: str, dir_b: str, label: str) -> None:
@@ -942,6 +963,110 @@ def test_planner_nonfinite(tmp: str) -> None:
     print(f"PASS planner rejects non-finite weights ({len(cases)} dtype/value cases)")
 
 
+def test_pwv4_table_kind(inspect_bin: str, tmp: str) -> None:
+    """Verify PWV4 table_kind dispatch (0/1=trained, 2=true-E8P) and rejection of unknown table_kind > 2."""
+    d = os.path.join(tmp, "pwv4_kind")
+    os.makedirs(d, exist_ok=True)
+
+    # 1. C++ build_true_e8p_tables == Python build_true_e8p_abs_codebook byte-for-byte
+    cxx = "clang++" if platform.system() == "Darwin" else "g++"
+    src = os.path.join(tmp, "test_true_e8p_tbl.cpp")
+    exe = os.path.join(tmp, "test_true_e8p_tbl")
+    hdr = os.path.join(REPO_ROOT, "src", "converters", "tfq4", "tfq4_format.hpp")
+    cpp_bin = os.path.join(d, "cpp_true_e8p.bin")
+    with open(src, "w", encoding="utf-8") as f:
+        f.write(
+            f'#include "{hdr}"\n'
+            '#include <cassert>\n'
+            'int main(int, char** argv) {\n'
+            '    tfq4::PwV4E8Tables t{};\n'
+            '    tfq4::build_true_e8p_tables(t);\n'
+            '    assert(t.table_kind == tfq4::PWV4_TABLE_TRUE_E8P);\n'
+            '    std::ofstream ofs(argv[1], std::ios::binary);\n'
+            '    ofs.write(reinterpret_cast<const char*>(&t), sizeof(t));\n'
+            '    ofs.close();\n'
+            '    return ofs.fail() ? 1 : 0;\n'
+            '}\n'
+        )
+    run([cxx, "-O2", "-std=c++17", "-Wall", "-Wextra", "-Werror", src, "-o", exe])
+    run([exe, cpp_bin])
+
+    py_cb, _ = tfq4_ref.build_true_e8p_abs_codebook()
+    py_bin = os.path.join(d, "py_true_e8p.bin")
+    tfq4_ref.write_pwv4_tables(py_bin, py_cb, tfq4_ref.PWV4_TABLE_TRUE_E8P)
+    assert open(cpp_bin, "rb").read() == open(py_bin, "rb").read(), "C++ vs Python PWV4 table_kind=2 byte mismatch"
+
+    # 2. table_kind=0 (legacy trained), 1 (trained alias), 2 (true-E8P) all accepted
+    tbl_k0 = os.path.join(REPO_ROOT, "reference", "tables", "pw_v4_e8p_tables.bin")
+    run([inspect_bin, tbl_k0], expect_ok=True)
+    lut0, kind0 = tfq4_ref.load_pwv4_tables_with_kind(tbl_k0)
+    assert kind0 == 0
+
+    tbl_k1 = os.path.join(d, "pw_v4_kind1.bin")
+    tfq4_ref.write_pwv4_tables(tbl_k1, lut0, tfq4_ref.PWV4_TABLE_TRAINED)
+    run([inspect_bin, tbl_k1], expect_ok=True)
+    _, kind1 = tfq4_ref.load_pwv4_tables_with_kind(tbl_k1)
+    assert kind1 == 1
+
+    run([inspect_bin, py_bin], expect_ok=True)
+    lut2, kind2 = tfq4_ref.load_pwv4_tables_with_kind(py_bin)
+    assert kind2 == 2 and np.array_equal(lut2, py_cb)
+
+    # 3. Unknown table_kind (> 2) MUST be rejected by BOTH tfq3-inspect and reference/tfq4_lattice.py
+    for bad_kind in (3, 99, 255):
+        bad_p = os.path.join(d, f"pw_v4_kind{bad_kind}.bin")
+        raw = bytearray(open(tbl_k0, "rb").read())
+        struct.pack_into("<I", raw, 16, bad_kind)
+        open(bad_p, "wb").write(raw)
+        proc = run([inspect_bin, bad_p], expect_ok=False)
+        assert "table_kind" in proc.stderr.lower(), proc.stderr
+        try:
+            tfq4_ref.load_pwv4_tables(bad_p)
+            raise AssertionError(f"tfq4_lattice accepted unknown table_kind={bad_kind}")
+        except ValueError as e:
+            assert "table_kind" in str(e).lower(), str(e)
+
+    # 4. Non-half-integer LUT entry in table_kind=2 rejected
+    bad_k2 = os.path.join(d, "pw_v4_bad_kind2.bin")
+    raw2 = bytearray(open(py_bin, "rb").read())
+    struct.pack_into("<H", raw2, 64, np.float16(0.25).view(np.uint16).item())
+    open(bad_k2, "wb").write(raw2)
+    run([inspect_bin, bad_k2], expect_ok=False)
+    try:
+        tfq4_ref.load_pwv4_tables(bad_k2)
+        raise AssertionError("tfq4_lattice accepted non-half-integer table_kind=2 LUT")
+    except ValueError:
+        pass
+
+    # 5. Full TFP4 shard roundtrip with table_kind=2 + XXH64 checksum
+    rng = np.random.default_rng(2026)
+    W = (rng.standard_normal((128, 256)).astype(np.float32) * 0.02)
+    W_rot = tfq4_ref.fwht2d_128(W)
+    _, codes_u16, scales_f16 = tfq4_ref.quant_true_e8p_e8_quarter(W_rot, py_cb)
+    words_u32 = (codes_u16[:, 0::2].astype(np.uint32) | (codes_u16[:, 1::2].astype(np.uint32) << np.uint32(16))).reshape(-1)
+    scales_flat = scales_f16.reshape(-1)
+    rec = bytearray(128)
+    rec[:11] = b"layer.0.e8p"
+    struct.pack_into("<IIIIQQfIII", rec, 80, 128, 256, 2, 0, 0, len(words_u32), 10.3, 128, 256, 0)
+    off_m, off_s = 64, ALIGN_16K
+    off_w = align16k(off_s + scales_flat.nbytes)
+    tot = align16k(off_w + words_u32.nbytes)
+    buf = bytearray(tot)
+    xxh = tfq3_ref.xxh64_sections((rec, scales_flat.tobytes(), words_u32.tobytes()))
+    struct.pack_into("<IIIIQQQQQQ", buf, 0, 0x34504654, 4, 1, tfq3_ref.FLAG_XXH64_PRESENT,
+                     off_m, off_s, off_w, len(scales_flat), len(words_u32), xxh)
+    buf[off_m : off_m + 128] = rec
+    buf[off_s : off_s + scales_flat.nbytes] = scales_flat.tobytes()
+    buf[off_w : off_w + words_u32.nbytes] = words_u32.tobytes()
+    sh_k2 = os.path.join(d, "true_e8p.tffp4")
+    open(sh_k2, "wb").write(buf)
+    run([inspect_bin, sh_k2], expect_ok=True)
+    W_dec = tfq4_ref.dequantize_tfp4_tensor(sh_k2, py_bin, "layer.0.e8p")
+    s_db = tfq4_ref.snr_db(W, W_dec)
+    assert s_db > 10.2, f"True E8P shard roundtrip SNR too low: {s_db:.2f} dB"
+    print(f"PASS PWV4 table_kind (0/1/2 accepted, >2 rejected, C++==Py kind=2, TFP4 roundtrip SNR={s_db:.2f} dB)")
+
+
 def test_xxh64_integrity(inspect_bin: str, tmp: str) -> None:
     """Verify XXH64 C++==Python parity and 1-byte bit-flip detection across meta, scales, weights of TFPN/TFPW/TFP4."""
     cxx = "clang++" if platform.system() == "Darwin" else "g++"
@@ -1211,6 +1336,7 @@ def main() -> None:
         test_inspector_negative_controls(inspect_bin, tmp)
         test_inspector_header_checks(inspect_bin, tmp)
         test_xxh64_integrity(inspect_bin, tmp)
+        test_pwv4_table_kind(inspect_bin, tmp)
         test_cli_basics(tfq3_cli, model_dir)
         test_planner_write_errors(model_dir, tmp)
         test_install_script(tmp)

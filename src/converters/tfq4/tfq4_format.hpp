@@ -25,12 +25,19 @@ static constexpr uint32_t MAGIC_TFP4 = 0x34504654u; // "TFP4"
 static constexpr uint32_t FORMAT_VER = 4u;
 static constexpr size_t   ALIGN_16K  = 16384;
 
+static constexpr uint32_t PWV4_TABLE_LEGACY_TRAINED = 0u; // legacy/default trained 256x8 (8 free sign bits)
+static constexpr uint32_t PWV4_TABLE_TRAINED        = 1u; // explicit alias for trained 256x8 (8 free sign bits)
+static constexpr uint32_t PWV4_TABLE_TRUE_E8P       = 2u; // true QuIP# E8P (E8 + 1/4, 256 abs + 7 sign + parity + coset)
+static constexpr uint32_t PWV4_TABLE_MAX_KNOWN      = 2u;
+static constexpr float    TRUE_E8P_BASE_SCALE       = 0.97f;
+
 struct PwV4E8Tables {
     uint32_t magic;
     uint32_t version;
-    uint32_t k_codes; // 256
-    uint32_t dim;     // 8
-    uint32_t pad0[12];
+    uint32_t k_codes;    // 256
+    uint32_t dim;        // 8
+    uint32_t table_kind; // 0=legacy/trained, 1=trained (alias), 2=true QuIP# E8P (E8 + 1/4); >2 unknown
+    uint32_t pad0[11];
     uint16_t e8p_lut[256][8]; // fp16 positive-orthant 8D centroids (4,096 bytes)
     uint8_t  pad1[16384 - 64 - 4096];
 };
@@ -102,10 +109,66 @@ static inline float f16_bits_to_f32(uint16_t h) {
 }
 
 // Canonical 100% data-free 256-code positive-orthant 8D E8-initialized Voronoi
-// Gaussian codebook (reproducible bit-for-bit on Apple Silicon Metal & NVIDIA CUDA).
+// Gaussian codebook (table_kind=0, reproducible bit-for-bit on Metal & CUDA).
 // Regenerate via src/tools/tfq3_train_tables.cpp (Box-Muller over std::mt19937).
 static inline void build_e8p_tables(PwV4E8Tables& t) {
     tfq_canonical::fill_canonical_pwv4(&t);
+}
+
+// Deterministic True QuIP# E8P (E8 + 1/4) table (table_kind=2):
+//   - 256 base positive half-integer vectors in |D8 + 1/2| (227 with ||a||^2 <= 10
+//     + 29 lowest-max-coordinate vectors from ||a||^2 = 12, exact in fp16).
+//   - Codeword (u16): bits[7:0]=abs_idx, bits[14:8]=s[0..6], bit[15]=coset.
+//     s[7] = popcount(s[0..6]) ^ (sum_d floor(a[d]) & 1) enforces s*a in D8 + 1/2;
+//     q = ((-1)^coset) * (s * a - 1/4) spans 65,536 unique points strictly in E8 + 1/4.
+static inline void build_true_e8p_tables(PwV4E8Tables& t) {
+    std::memset(&t, 0, sizeof(t));
+    t.magic      = MAGIC_PWV4;
+    t.version    = FORMAT_VER;
+    t.k_codes    = 256u;
+    t.dim        = 8u;
+    t.table_kind = PWV4_TABLE_TRUE_E8P;
+
+    struct Cand {
+        int n2_x4;
+        int max_m;
+        std::array<uint8_t, 8> m;
+    };
+    std::vector<Cand> cands;
+    cands.reserve(512);
+    // Pure integer enumeration over m_d in {0, 1, 2} (entries {0.5, 1.5, 2.5}); 3^8 = 6561.
+    for (int code = 0; code < 6561; ++code) {
+        int tmp = code, n2 = 0, mx = 0;
+        std::array<uint8_t, 8> m{};
+        for (int d = 7; d >= 0; --d) {
+            int md = tmp % 3;
+            tmp /= 3;
+            m[d] = static_cast<uint8_t>(md);
+            int v2 = 2 * md + 1;
+            n2 += v2 * v2;
+            if (md > mx) mx = md;
+        }
+        if (n2 <= 48) cands.push_back(Cand{n2, mx, m});
+    }
+    std::sort(cands.begin(), cands.end(), [](const Cand& a, const Cand& b) {
+        if (a.n2_x4 != b.n2_x4) return a.n2_x4 < b.n2_x4;
+        if (a.max_m != b.max_m) return a.max_m < b.max_m;
+        return a.m < b.m;
+    });
+    for (int k = 0; k < 256; ++k) {
+        for (int d = 0; d < 8; ++d) {
+            t.e8p_lut[k][d] = f32_to_f16_bits(static_cast<float>(cands[k].m[d]) + 0.5f);
+        }
+    }
+}
+
+static inline uint8_t true_e8p_abs_parity(const uint16_t row[8]) {
+    uint32_t s = 0u;
+    for (int d = 0; d < 8; ++d) {
+        float v = f16_bits_to_f32(row[d]);
+        s += static_cast<uint32_t>(std::lround(v - 0.5f));
+    }
+    return static_cast<uint8_t>(s & 1u);
 }
 
 static inline uint64_t align_up_16k(uint64_t x) {

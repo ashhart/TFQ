@@ -481,7 +481,9 @@ def load_real_tfq4_binary_weights(model_dir: str, tmp_dir: str) -> tuple[dict[st
             R, C, _, _, _, _, _, orig_r, orig_c, _ = struct.unpack("<IIIIQQfIII", rec[80:])
             orig_r = orig_r or R
             orig_c = orig_c or C
-            weights[nm] = np.ascontiguousarray(tfq4_ref.dequantize_tfp4_tensor(shard_path, tbl_path, nm)[:orig_r, :orig_c])
+            weights[nm] = np.ascontiguousarray(
+                tfq4_ref.dequantize_tfp4_tensor(shard_path, tbl_path, nm, verify_checksum=False)[:orig_r, :orig_c]
+            )
     prov = {
         "converter_binary": os.path.basename(conv_bin),
         "converter_binary_sha256": sha256_file(conv_bin),
