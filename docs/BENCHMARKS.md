@@ -43,14 +43,18 @@ Every section and claim in this document is explicitly tagged with its verificat
 | TFQ3-3b + Hessian-LDLQ (`beam=8`, `TFPN`) | 3.001 | Yes | 13.93 dB | **19.83 dB** | 11.9019 | `+0.25534 [+0.24800, +0.26289]` | 0.29709 | 2.3129 | 75.25% | 226.5 s |
 | Scalar Lloyd-Max + LDLQ 3b (in-house ref) | 3.001 | Yes | 12.61 dB | **20.26 dB** | **10.9609** | **`+0.17298 [+0.16512, +0.18215]`** | **0.20569** | 1.7974 | **79.38%** | 99.8 s |
 
-### 2-Bit Stress Test (`All 196 Layers Uniform 2-Bit on 1.5B Dense`)
+### Sub-3-Bit Stress Test (`All 196 Layers Uniform 2.00–2.25 bpw on 1.5B Dense`)
 
 | Quantizer | Eff. bpw | Calib? | Weight SNR | Held-Out Out-SNR | WikiText-2 PPL (296,815 tok) | Paired `ΔNLL` vs BF16 (95% CI) | Mean KL (all tok) | p99 KL | Same Top-1 | Conv Time |
 |---|---:|---|---:|---:|---:|---|---:|---:|---:|---:|
 | RTN / Affine 2b (in-house, `g64`) | 2.500 | No | 6.54 dB | 7.34 dB | 44,228.2 | `+8.47576 [+8.40813, +8.54594]` | 8.49874 | 18.5430 | 1.91% | 0.3 s |
 | GPTQ-LDLQ 2b (in-house, no act-order, `g128`) | 2.250 | Yes | 2.40 dB | 9.10 dB | 772,872.3 | `+11.33651 [+11.28333, +11.39024]` | 11.37398 | 21.5028 | 0.33% | 66.4 s |
-| **TFQ4-E8P 2b Data-Free (real `.tffp4`)** | **2.001** | **No** | **10.09 dB** | **10.86 dB** | **344.19** | **`+3.61985 [+3.56894, +3.67487]`** | **3.65567** | **11.0220** | **22.46%** | **4.2 s** |
-| **TFQ4-E8P 2b + Hessian-LDLQ (same `TFP4`)** | **2.001** | Yes | 8.24 dB | **15.18 dB** | **33.62** | **`+1.29374 [+1.18321, +1.40998]`** | **1.34896** | **7.4729** | **52.38%** | 210.5 s |
+| TFQ4-E8P `kind=0` 2b Data-Free (real `.tffp4`) | 2.001 | No | 10.09 dB | 10.86 dB | 344.19 | `+3.61985 [+3.56894, +3.67487]` | 3.65567 | 11.0220 | 22.46% | 4.2 s |
+| TFQ4 True E8P-256 `kind=2` Data-Free (real `.tffp4`) | 2.001 | No | 10.36 dB | 11.12 dB | 176.10 | `+2.9497 [+2.9118, +2.9868]` | 2.9820 | 9.4430 | 28.13% | 3.5 s |
+| **TFQ4 True E8P-1024 `kind=3` Data-Free (real `.tffp4`)** | **2.251** | **No** | **11.73 dB** | **12.51 dB** | **47.25** | **`+1.6342 [+1.6056, +1.6622]`** | **1.6655** | **7.0625** | **46.64%** | **3.6 s** |
+| TFQ4-E8P `kind=0` 2b + Hessian-LDLQ (same `TFP4`) | 2.001 | Yes | 8.24 dB | 15.18 dB | 33.62 | `+1.29374 [+1.18321, +1.40998]` | 1.34896 | 7.4729 | 52.38% | 210.5 s |
+| TFQ4 True E8P-256 `kind=2` + Hessian-LDLQ (same `TFP4`) | 2.001 | Yes | 8.50 dB | 15.45 dB | 31.05 | `+1.2143 [+1.1134, +1.3268]` | 1.2679 | 7.0537 | 53.77% | — |
+| **TFQ4 True E8P-1024 `kind=3` + Hessian-LDLQ (`TFP4`)** | **2.251** | **Yes** | **9.82 dB** | **16.92 dB** | **16.00** | **`+0.5514 [+0.5028, +0.6077]`** | **0.6026** | **4.3775** | **66.62%** | — |
 
 ### Honest Takeaways from the Controlled Comparison
 - **Where data-free TFQ3 wins:** At `4.001 bpw` and `3.001 bpw` with **zero calibration data** in ~23–30 seconds, data-free TFQ3 beats our in-house RTN/Affine (`4.50`/`3.50 bpw`), AWQ-style (`4.25`/`3.25 bpw`), and no-act-order GPTQ-LDLQ (`4.25`/`3.25 bpw`) baselines with non-overlapping paired 95% ΔNLL CIs at both bit widths (`+0.04494` vs `+0.05270` nats at 4-bit, `-29%` p99 KL; `+0.19971` vs `+0.31334` nats at 3-bit, `-1.35 PPL`, `-35%` mean KL, `-45%` p99 KL).
@@ -180,6 +184,8 @@ Verified via `make test-metal`, `make test-tfq4-metal`, and `python3 tests/vecto
 | TFQ3-4b `qkv` | `[10240 × 5120]` | **0.110 ms (`239.0 GB/s`)** | **0.162 ms (`161.4 GB/s`, 10.33 TFLOP/s)** | **13.67 TFLOP/s** (3.93 ms) |
 | **TFQ4-E8P 2b `MoE-8E-gu`** | `[32768 × 4096]` | **0.086 ms (`390.2 GB/s`)** | 0.761 ms (`44.1 GB/s`, `r1==r16`) | — |
 | **TFQ4-E8P 2b `Qwen27-gu`** | `[34816 × 5120]` | **0.122 ms (`366.1 GB/s`)** | 1.065 ms (`41.9 GB/s`, `r1==r16`) | — |
+| **TFQ4-E8P-1024 2.25b `Qwen27-gu`** (`kind=3`) | `[34816 × 5120]` | **0.159 ms (`314.8 GB/s`)** | 1.410 ms (`35.6 GB/s`, `r1==r16`) | — |
+| **TFQ4-E8P-1024 2.25b `MoE-8E-gu`** (`kind=3`) | `[32768 × 4096]` | **0.168 ms (`225.4 GB/s`)** | 0.992 ms (`38.1 GB/s`, `r1==r16`) | — |
 
 ---
 
@@ -190,8 +196,11 @@ Verified via `make test-metal`, `make test-tfq4-metal`, and `python3 tests/vecto
 | **Qwen2.5-1.5B** (BF16) | `--bits 4 --quantize-embed` | Metal (M5 Max) | 197 | all 4b (`4.001 bpw`) | 0.719 GiB | **23.36 dB** | 23.2 s |
 | **Qwen2.5-1.5B** (BF16) | `--target-gib 0.65 --quantize-embed` | Metal (M5 Max) | 197 | `3b:44 / 4b:146 / 5b:7` (`3.614 bpw`) | **0.650 GiB** | `17.33 / 23.35 / 29.18 dB` | 23.2 s |
 | **Qwen2.5-1.5B** (BF16) | `--bits 2 --quantize-embed` (TFQ4-E8P) | Metal (M5 Max) | 197 | all 2b-E8P (`2.001 bpw`) | **0.360 GiB** | **10.09 dB** | **1.3 s** |
+| **Qwen2.5-1.5B** (BF16) | `--bits 2.25 --table-kind e8p1024` (`kind=3`) | **Metal / CUDA (GB10)** | 196 | all 2.25b-E8P-1024 (`2.251 bpw`) | **0.343 GiB** | **11.73 / 11.73 dB** *(SHA-256 identical)* | **3.6 s / 3.4 s** |
 | **Qwen3.8-27B-DFlash2** | `--quantize-drafter --bits 4` | Metal / CUDA (GB10) | 47 | all 4b (`4.001 bpw`) | 0.837 GiB | **23.32 / 23.32 dB** | 27.7 s / 26.2 s |
 | **Qwen3.8-27B-DFlash2** | `--quantize-drafter --bits 2` (TFQ4-E8P) | Metal / CUDA (GB10) | 47 | all 2b-E8P (`2.001 bpw`) | **0.419 GiB** | **10.07 / 10.07 dB** | 2.8 s / **2.4 s** |
+| **Inkling-2-Mini** (24L, 128E MoE) | `--inkling2-mode heat43225` (`15/25/60%`) | CUDA (GB10) *(L00/L20 Metal==CUDA)* | 9,216 | `4b:19 / 3b:32 / 2.25b:77` (`2.698 bpw`) | **7.68 GiB** (`-32.6%` vs 4b) | `23.31 / 17.14 / 11.76 dB` | **189.1 s** |
+| **Inkling-2-Mini** (24L, 128E MoE) | `--inkling2-mode heat432` (`15/25/60%`) | CUDA (GB10) *(L00/L20 Metal==CUDA)* | 9,216 | `4b:19 / 3b:32 / 2.00b:77` (`2.548 bpw`) | **7.26 GiB** (`-36.3%` vs 4b) | `23.31 / 17.14 / 10.38 dB` | **160.0 s** |
 
 ---
 

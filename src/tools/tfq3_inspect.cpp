@@ -306,11 +306,26 @@ static bool inspect_tfpw(const std::string& path) {
     }
     fclose(f);
 
-    uint64_t cnt[6] = {};
-    double snr_sum[6] = {};
+    // Bucket index: 0=2b, 1=2.25b, 2=3b, 3=4b, 4=5b
+    uint64_t cnt[5] = {};
+    double snr_sum[5] = {};
     const uint64_t exp_sc = (uint64_t)(h.moe_inter / 128u) * (h.hidden_size / 128u);
     for (const auto& m : metas) {
-        if (m.b_bits != 3u && m.b_bits != 4u && m.b_bits != 5u) {
+        int bkt = -1;
+        uint64_t gu_words = 0, dn_words = 0;
+        if (m.b_bits == 2u) {
+            bkt = 0;
+            gu_words = (uint64_t)h.moe_inter * (h.hidden_size / 16u);
+            dn_words = (uint64_t)h.hidden_size * (h.moe_inter / 16u);
+        } else if (m.b_bits == 225u) {
+            bkt = 1;
+            gu_words = (uint64_t)h.moe_inter * (h.hidden_size / 128u) * 9ULL;
+            dn_words = (uint64_t)h.hidden_size * (h.moe_inter / 128u) * 9ULL;
+        } else if (m.b_bits == 3u || m.b_bits == 4u || m.b_bits == 5u) {
+            bkt = (int)(m.b_bits - 1u);
+            gu_words = (uint64_t)(h.moe_inter / 16u) * (h.hidden_size / 128u) * (m.b_bits * 2u) * 32ULL;
+            dn_words = (uint64_t)(h.hidden_size / 16u) * (h.moe_inter / 128u) * (m.b_bits * 2u) * 32ULL;
+        } else {
             fprintf(stderr, "FAIL %s: invalid expert bits (%u)\n", path.c_str(), m.b_bits);
             return false;
         }
@@ -318,8 +333,6 @@ static bool inspect_tfpw(const std::string& path) {
             fprintf(stderr, "FAIL %s: non-finite expert SNR\n", path.c_str());
             return false;
         }
-        uint64_t gu_words = (uint64_t)(h.moe_inter / 16u) * (h.hidden_size / 128u) * (m.b_bits * 2u) * 32ULL;
-        uint64_t dn_words = (uint64_t)(h.hidden_size / 16u) * (h.moe_inter / 128u) * (m.b_bits * 2u) * 32ULL;
         if (!check_range(m.gate_word_off, gu_words, h.stream_words) ||
             !check_range(m.up_word_off, gu_words, h.stream_words) ||
             !check_range(m.down_word_off, dn_words, h.stream_words) ||
@@ -329,17 +342,20 @@ static bool inspect_tfpw(const std::string& path) {
             fprintf(stderr, "FAIL %s: expert weight or scale out of bounds\n", path.c_str());
             return false;
         }
-        cnt[m.b_bits]++;
-        snr_sum[m.b_bits] += (m.gate_snr_db + m.up_snr_db + m.down_snr_db) / 3.0;
+        cnt[bkt]++;
+        snr_sum[bkt] += (m.gate_snr_db + m.up_snr_db + m.down_snr_db) / 3.0;
     }
     uint64_t params = (uint64_t)h.num_experts * 3ULL * h.hidden_size * h.moe_inter;
     double bpw = params ? (double)(h.stream_words * 32ULL + h.scale_halfs * 16ULL) / (double)params : 0.0;
-    printf("OK   %-42s TFPW v%u | L%02u E=%u H=%u I=%u | %6.3f GiB | %.3f bpw | 3b:%llu(%.2fdB) 4b:%llu(%.2fdB) 5b:%llu(%.2fdB)\n",
+    printf("OK   %-42s TFPW v%u | L%02u E=%u H=%u I=%u | %6.3f GiB | %.3f bpw |",
            path.c_str(), h.version, h.layer_idx, h.num_experts, h.hidden_size, h.moe_inter,
-           (double)sz / (double)(1ULL << 30), bpw,
+           (double)sz / (double)(1ULL << 30), bpw);
+    if (cnt[0]) printf(" 2b:%llu(%.2fdB)", (unsigned long long)cnt[0], snr_sum[0] / cnt[0]);
+    if (cnt[1]) printf(" 2.25b:%llu(%.2fdB)", (unsigned long long)cnt[1], snr_sum[1] / cnt[1]);
+    printf(" 3b:%llu(%.2fdB) 4b:%llu(%.2fdB) 5b:%llu(%.2fdB)\n",
+           (unsigned long long)cnt[2], cnt[2] ? snr_sum[2] / cnt[2] : 0.0,
            (unsigned long long)cnt[3], cnt[3] ? snr_sum[3] / cnt[3] : 0.0,
-           (unsigned long long)cnt[4], cnt[4] ? snr_sum[4] / cnt[4] : 0.0,
-           (unsigned long long)cnt[5], cnt[5] ? snr_sum[5] / cnt[5] : 0.0);
+           (unsigned long long)cnt[4], cnt[4] ? snr_sum[4] / cnt[4] : 0.0);
     return true;
 }
 
@@ -368,37 +384,51 @@ static float f16_to_f32_local(uint16_t h) {
 
 static bool inspect_pwv4(const std::string& path) {
     uint64_t sz = file_size(path);
-    if (sz != 16384ULL) {
-        fprintf(stderr, "FAIL %s: expected 16384 bytes (%llu)\n", path.c_str(), (unsigned long long)sz);
+    if (sz != 16384ULL && sz != 32768ULL) {
+        fprintf(stderr, "FAIL %s: expected 16384 or 32768 bytes (%llu)\n", path.c_str(), (unsigned long long)sz);
         return false;
     }
     FILE* f = fopen(path.c_str(), "rb");
     if (!f) { fprintf(stderr, "FAIL %s: cannot open\n", path.c_str()); return false; }
-    uint8_t buf[16384];
-    bool ok = (fread(buf, 1, sizeof(buf), f) == sizeof(buf));
+    std::vector<uint8_t> buf((size_t)sz);
+    bool ok = (fread(buf.data(), 1, buf.size(), f) == buf.size());
     fclose(f);
     if (!ok) { fprintf(stderr, "FAIL %s: short read\n", path.c_str()); return false; }
 
     uint32_t hdr[5];
-    std::memcpy(hdr, buf, 20);
-    if (hdr[0] != MAGIC_PWV4 || hdr[1] != TFQ4_VER || hdr[2] != 256u || hdr[3] != 8u) {
+    std::memcpy(hdr, buf.data(), 20);
+    if (hdr[0] != MAGIC_PWV4 || hdr[1] != TFQ4_VER || hdr[3] != 8u) {
         fprintf(stderr, "FAIL %s: bad PWV4 header\n", path.c_str());
         return false;
     }
+    const uint32_t k_codes = hdr[2];
     const uint32_t table_kind = hdr[4];
-    if (table_kind > 2u) {
-        fprintf(stderr, "FAIL %s: unknown PWV4 table_kind %u (supported: 0/1=trained, 2=true-E8P)\n",
+    if (table_kind > 3u) {
+        fprintf(stderr, "FAIL %s: unknown PWV4 table_kind %u (supported: 0/1=trained, 2=true-E8P, 3=true-E8P-1024)\n",
                 path.c_str(), table_kind);
         return false;
     }
-    for (size_t i = 0; i < 256u * 8u; ++i) {
+    if (table_kind == 3u) {
+        if (sz != 32768ULL || k_codes != 1024u) {
+            fprintf(stderr, "FAIL %s: PWV4 table_kind 3 requires 32768 bytes and k_codes=1024 (got %llu bytes, k_codes=%u)\n",
+                    path.c_str(), (unsigned long long)sz, k_codes);
+            return false;
+        }
+    } else {
+        if (sz != 16384ULL || k_codes != 256u) {
+            fprintf(stderr, "FAIL %s: PWV4 table_kind %u requires 16384 bytes and k_codes=256 (got %llu bytes, k_codes=%u)\n",
+                    path.c_str(), table_kind, (unsigned long long)sz, k_codes);
+            return false;
+        }
+    }
+    for (size_t i = 0; i < (size_t)k_codes * 8u; ++i) {
         uint16_t h;
-        std::memcpy(&h, buf + 64 + i * 2, 2);
+        std::memcpy(&h, buf.data() + 64 + i * 2, 2);
         if (!f16_is_nonneg_finite(h)) {
             fprintf(stderr, "FAIL %s: invalid PWV4 e8p_lut entry [%zu][%zu] (0x%04x)\n", path.c_str(), i / 8, i % 8, h);
             return false;
         }
-        if (table_kind == 2u) {
+        if (table_kind == 2u || table_kind == 3u) {
             float v = f16_to_f32_local(h);
             float two_v = v * 2.0f;
             float r = std::round(two_v);
@@ -409,9 +439,12 @@ static bool inspect_pwv4(const std::string& path) {
             }
         }
     }
-    const char* kind_lbl = (table_kind == 2u) ? "true-E8P (E8+1/4)" : "trained-256x8";
-    printf("OK   %-42s PWV4 v%u | 16384 bytes | kind=%u (%s) %ux%uD (4 KiB LUT)\n",
-           path.c_str(), hdr[1], table_kind, kind_lbl, hdr[2], hdr[3]);
+    const char* kind_lbl = (table_kind == 3u)
+        ? "true-E8P-1024 (E8+1/4)"
+        : ((table_kind == 2u) ? "true-E8P (E8+1/4)" : "trained-256x8");
+    const uint32_t lut_kib = (k_codes * 8u * 2u) / 1024u;
+    printf("OK   %-42s PWV4 v%u | %llu bytes | kind=%u (%s) %ux%uD (%u KiB LUT)\n",
+           path.c_str(), hdr[1], (unsigned long long)sz, table_kind, kind_lbl, k_codes, hdr[3], lut_kib);
     return true;
 }
 
@@ -467,7 +500,8 @@ static bool inspect_tfp4(const std::string& path, bool verbose, std::unordered_s
 
     std::unordered_set<std::string> local_seen;
     uint64_t params_total = 0;
-    double snr_sum = 0.0;
+    uint64_t cnt_20 = 0, cnt_225 = 0;
+    double snr_20 = 0.0, snr_225 = 0.0;
     for (const auto& m : metas) {
         std::string tname;
         if (!extract_tensor_name(m.name, tname)) {
@@ -482,8 +516,15 @@ static bool inspect_tfp4(const std::string& path, bool verbose, std::unordered_s
             fprintf(stderr, "FAIL %s: non-finite SNR for TFP4 tensor %s\n", path.c_str(), tname.c_str());
             return false;
         }
-        uint64_t exp_w = (uint64_t)m.R * (m.C / 16u), exp_s = (uint64_t)(m.R / 128u) * (m.C / 128u);
-        if (m.b_bits != 2u || m.R == 0 || m.C == 0 || (m.R % 128u) || (m.C % 128u) || m.word_count != exp_w ||
+        if ((m.b_bits != 2u && m.b_bits != 225u) || m.R == 0 || m.C == 0 || (m.R % 128u) || (m.C % 128u)) {
+            fprintf(stderr, "FAIL %s: invalid TFP4 tensor %s [%u,%u] bits=%u\n", path.c_str(), tname.c_str(), m.R, m.C, m.b_bits);
+            return false;
+        }
+        uint64_t exp_w = (m.b_bits == 225u)
+            ? ((uint64_t)m.R * (m.C / 128u) * 9ULL)
+            : ((uint64_t)m.R * (m.C / 16u));
+        uint64_t exp_s = (uint64_t)(m.R / 128u) * (m.C / 128u);
+        if (m.word_count != exp_w ||
             !check_orig_dim(m.pad[0], m.R) || !check_orig_dim(m.pad[1], m.C) ||
             !check_range(m.word_off, m.word_count, h.total_weight_words) ||
             !check_range((uint64_t)m.sc_off, exp_s, h.total_scale_halfs)) {
@@ -491,19 +532,23 @@ static bool inspect_tfp4(const std::string& path, bool verbose, std::unordered_s
             return false;
         }
         params_total += (uint64_t)m.R * m.C;
-        snr_sum += m.snr_db;
+        if (m.b_bits == 225u) { cnt_225++; snr_225 += m.snr_db; }
+        else                  { cnt_20++;  snr_20  += m.snr_db; }
         if (verbose) {
+            const char* tag = (m.b_bits == 225u) ? "2.25b-E8P1024" : "2b-E8P";
             uint32_t orig_r = m.pad[0] ? m.pad[0] : m.R, orig_c = m.pad[1] ? m.pad[1] : m.C;
             if (orig_r != m.R || orig_c != m.C)
-                printf("  %-52s [%6u, %5u] (pad %ux%u) 2b-E8P SNR=%5.2f dB\n", tname.c_str(), orig_r, orig_c, m.R, m.C, m.snr_db);
+                printf("  %-52s [%6u, %5u] (pad %ux%u) %s SNR=%5.2f dB\n", tname.c_str(), orig_r, orig_c, m.R, m.C, tag, m.snr_db);
             else
-                printf("  %-52s [%6u, %5u] 2b-E8P SNR=%5.2f dB\n", tname.c_str(), m.R, m.C, m.snr_db);
+                printf("  %-52s [%6u, %5u] %s SNR=%5.2f dB\n", tname.c_str(), m.R, m.C, tag, m.snr_db);
         }
     }
     double bpw = params_total ? (double)(h.total_weight_words * 32ULL + h.total_scale_halfs * 16ULL) / (double)params_total : 0.0;
-    printf("OK   %-42s TFP4 v%u | %3u tensors | %6.3f GiB | %.3f bpw | E8P-2b:%zu(%.2fdB)\n",
-           path.c_str(), h.version, h.num_tensors, (double)sz / (double)(1ULL << 30), bpw,
-           metas.size(), metas.empty() ? 0.0 : snr_sum / metas.size());
+    printf("OK   %-42s TFP4 v%u | %3u tensors | %6.3f GiB | %.3f bpw |",
+           path.c_str(), h.version, h.num_tensors, (double)sz / (double)(1ULL << 30), bpw);
+    if (cnt_20 || !cnt_225) printf(" E8P-2b:%llu(%.2fdB)", (unsigned long long)cnt_20, cnt_20 ? snr_20 / cnt_20 : 0.0);
+    if (cnt_225) printf(" E8P-2.25b:%llu(%.2fdB)", (unsigned long long)cnt_225, snr_225 / cnt_225);
+    printf("\n");
     return true;
 }
 

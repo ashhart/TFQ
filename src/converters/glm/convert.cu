@@ -6,6 +6,8 @@
 // ============================================================================
 #include "../cuda_encode_common.cuh"
 #include "../moe_heat_rank.hpp"
+#include "../tfq4/tfq4_format.hpp"
+#include "../tfq4/tfq4_encode_common.cuh"
 
 static std::map<int, std::vector<int>> load_heat_ranks(const std::string& trace_path, int n_exp) {
     std::map<int, std::vector<int>> counts;
@@ -65,15 +67,27 @@ int main(int argc, char** argv) {
         else if (a == "--skip-head") skip_head = true;
     }
     if (model_dir.empty() || out_dir.empty()) {
-        fprintf(stderr, "Usage: %s --model <dir> --out <dir> [--mode heat543|heat43|heat443|uniform4|uniform3|nonmoe] [--layers S E] [--trace <file>] [--fast4b] [--shared-pw5] [--head-pw5] [--all-pw5] [--skip-head] [--skip-existing] [--tables <path>]\n", argv[0]);
+        fprintf(stderr, "Usage: %s --model <dir> --out <dir> [--mode heat543|heat43|heat443|uniform4|uniform3|heat432|heat42|heat43225|uniform2|uniform225|nonmoe] [--layers S E] [--trace <file>] [--fast4b] [--shared-pw5] [--head-pw5] [--all-pw5] [--skip-head] [--skip-existing] [--tables <path>]\n", argv[0]);
+        return 1;
+    }
+    if (mode != "heat543" && mode != "heat43" && mode != "heat443" && mode != "uniform4" && mode != "uniform3" &&
+        mode != "heat432" && mode != "heat42" && mode != "heat43225" && mode != "uniform2" && mode != "uniform225" &&
+        mode != "nonmoe") {
+        fprintf(stderr, "Error: unknown --mode %s\n", mode.c_str());
         return 1;
     }
     mkdir(out_dir.c_str(), 0755);
+    const bool mode_uses_2b   = (mode == "heat432" || mode == "heat42" || mode == "uniform2");
+    const bool mode_uses_225b = (mode == "heat43225" || mode == "uniform225");
+    const bool mode_uses_tfq4 = mode_uses_2b || mode_uses_225b;
     const bool explicit_tables = !tables_path.empty();
     if (!explicit_tables) tables_path = out_dir + "/pw_v3_tables.bin";
 
     PwV3TablesFile tbl;
     load_or_generate_tables(tables_path, tbl, explicit_tables);
+    if (mode_uses_tfq4) {
+        tfq4::write_hybrid_pwv4_tables(out_dir + "/pw_v4_e8p_tables.bin", mode_uses_225b);
+    }
     auto grid3 = build_grid(tbl.lut3_u32,  256,   64, 2, 16,  8);
     auto grid4 = build_grid(tbl.lut4_u32, 1024,  256, 2, 16, 10);
     auto grid5 = build_grid(tbl.lut5_u32, 1024, 1024, 0, 32, 12);
@@ -93,6 +107,19 @@ int main(int argc, char** argv) {
     up_tbl(3, tbl.lut3_u32, 256, tbl.c64_3, grid3);
     up_tbl(4, tbl.lut4_u32, 1024, tbl.c64_4, grid4);
     up_tbl(5, tbl.lut5_u32, 1024, tbl.c64_5, grid5);
+
+    __half* d_e8p_lut = nullptr;
+    if (mode_uses_225b) {
+        tfq4::PwV4E8Tables1024 t4{};
+        tfq4::build_true_e8p_1024_tables(t4);
+        TFQ_CUDA_CHECK(cudaMalloc(&d_e8p_lut, sizeof(t4.e8p_lut)));
+        TFQ_CUDA_CHECK(cudaMemcpy(d_e8p_lut, t4.e8p_lut, sizeof(t4.e8p_lut), cudaMemcpyHostToDevice));
+    } else if (mode_uses_2b) {
+        tfq4::PwV4E8Tables t4{};
+        tfq4::build_true_e8p_tables(t4);
+        TFQ_CUDA_CHECK(cudaMalloc(&d_e8p_lut, sizeof(t4.e8p_lut)));
+        TFQ_CUDA_CHECK(cudaMemcpy(d_e8p_lut, t4.e8p_lut, sizeof(t4.e8p_lut), cudaMemcpyHostToDevice));
+    }
 
     ShardCache cache;
     cache.init(model_dir);
@@ -276,6 +303,13 @@ int main(int argc, char** argv) {
     TFQ_CUDA_CHECK(cudaMalloc(&d_pack, (size_t)(I / 16) * (size_t)(H / 128) * 10ULL * 32ULL * 4ULL));
     TFQ_CUDA_CHECK(cudaMalloc(&d_sc,  (size_t)N_SC * 2ULL));
     TFQ_CUDA_CHECK(cudaMalloc(&d_se,  (size_t)(std::max(H, I) / 16) * 2ULL * 4ULL));
+    const uint32_t MAX_TFQ4_TG = (uint32_t)((MAX_E / 16ULL + 255ULL) / 256ULL);
+    float* d_tfq4_met = nullptr;
+    std::vector<float> h_tfq4_met;
+    if (mode_uses_tfq4) {
+        TFQ_CUDA_CHECK(cudaMalloc(&d_tfq4_met, (size_t)MAX_TFQ4_TG * 2ULL * 4ULL));
+        h_tfq4_met.resize((size_t)MAX_TFQ4_TG * 2ULL);
+    }
 
     auto heat_ranks = trace_path.empty() ? std::map<int, std::vector<int>>{} : load_heat_ranks(trace_path, N_EXP);
     const char* proj_names[3] = {"gate_proj", "up_proj", "down_proj"};
@@ -309,20 +343,28 @@ int main(int argc, char** argv) {
         }
         std::vector<PrismExpertMeta> metas(N_EXP);
         memset(metas.data(), 0, metas.size() * sizeof(PrismExpertMeta));
-        const int thr5 = (N_EXP == 288) ? 64  : (N_EXP / 4);
-        const int thr4 = (N_EXP == 288) ? 160 : ((N_EXP * 5) / 8);
-        const int thr43 = (N_EXP == 288) ? 96 : (N_EXP / 3);
+        const int thr5    = (N_EXP == 288) ? 64  : (N_EXP / 4);
+        const int thr4    = (N_EXP == 288) ? 160 : ((N_EXP * 5) / 8);
+        const int thr43   = (N_EXP == 288) ? 96  : (N_EXP / 3);
+        const int thr4_15 = (N_EXP * 15 + 50) / 100;
+        const int thr3_40 = (N_EXP * 40 + 50) / 100;
+        const int thr4_20 = (N_EXP * 20 + 50) / 100;
         uint64_t cur_word = 0; uint32_t cur_sc = 0;
         for (int e = 0; e < N_EXP; ++e) {
             int r = ranks[e];
             uint32_t b = 4u;
-            if (mode == "heat543")       b = (r < thr5) ? 5u : (r < thr4 ? 4u : 3u);
-            else if (mode == "heat443")  b = (r < thr4) ? 4u : 3u;
-            else if (mode == "heat43")   b = (r < thr43) ? 4u : 3u;
-            else if (mode == "uniform4") b = 4u;
-            else if (mode == "uniform3") b = 3u;
+            if (mode == "heat543")         b = (r < thr5) ? 5u : (r < thr4 ? 4u : 3u);
+            else if (mode == "heat443")    b = (r < thr4) ? 4u : 3u;
+            else if (mode == "heat43")     b = (r < thr43) ? 4u : 3u;
+            else if (mode == "uniform4")   b = 4u;
+            else if (mode == "uniform3")   b = 3u;
+            else if (mode == "heat432")    b = (r < thr4_15) ? 4u : ((r < thr3_40) ? 3u : 2u);
+            else if (mode == "heat42")     b = (r < thr4_20) ? 4u : 2u;
+            else if (mode == "heat43225")  b = (r < thr4_15) ? 4u : ((r < thr3_40) ? 3u : 225u);
+            else if (mode == "uniform2")   b = 2u;
+            else if (mode == "uniform225") b = 225u;
             metas[e].b_bits = b; metas[e].heat_rank = (uint32_t)r;
-            uint64_t wpm = (uint64_t)(I / 16) * (H / 128) * (b * 2u) * 32u;
+            uint64_t wpm = tfq4::tfpw_proj_words((uint32_t)I, (uint32_t)H, b);
             metas[e].gate_word_off = cur_word; cur_word += wpm;
             metas[e].up_word_off   = cur_word; cur_word += wpm;
             metas[e].down_word_off = cur_word; cur_word += wpm;
@@ -334,7 +376,8 @@ int main(int argc, char** argv) {
         std::vector<uint32_t> all_weights(cur_word);
         for (int e = 0; e < N_EXP; ++e) {
             uint32_t b = metas[e].b_bits;
-            uint64_t wpm = (uint64_t)(I / 16) * (H / 128) * (b * 2u) * 32u;
+            const bool is_tfq4 = (b == tfq4::TFQ4_BITS_200 || b == tfq4::TFQ4_BITS_225);
+            uint64_t wpm = tfq4::tfpw_proj_words((uint32_t)I, (uint32_t)H, b);
             for (int p = 0; p < 3; ++p) {
                 uint32_t R = proj_R[p], C = proj_C[p];
                 char base[256]; snprintf(base, sizeof(base), "%s.%d.mlp.experts.%d.%s", layer_prefix.c_str(), lyr, e, proj_names[p]);
@@ -361,16 +404,32 @@ int main(int argc, char** argv) {
                     fp8_dequant_row_fwht_kernel<<<dim3(C / 128u, R, 1), 32>>>(d_fp8, d_scinv, d_fp8_lut, d_tmp, mp);
                 }
                 col_fwht_and_ss_kernel<<<dim3(C, R / 128u, 1), 32>>>(d_tmp, d_rot, d_ss, mp);
-                finalize_scales_and_pack_nax_kernel<<<dim3(R / 16u, C / 128u, 1), 32>>>(d_rot, d_ss, d_sc, d_str, mp);
-                uint32_t n_str = (R / 16u) * 32u;
-                for (uint32_t off = 0; off < n_str; off += CHUNK_STR) {
-                    uint32_t cnt = std::min(CHUNK_STR, n_str - off);
-                    launch_prism_encode(b, cnt, d_str, d_lut[b], d_c64[b], d_grid[b], d_hist, d_pack, EncParams{R, C, b, off, cnt});
-                }
-                prism_verify_v3_snr_kernel<<<R / 16u, 32>>>(d_pack, d_sc, d_lut[b], d_c64[b], d_rot, d_se, mp);
-                TFQ_CUDA_CHECK(cudaDeviceSynchronize());
                 double c_sig = 0.0, c_err = 0.0;
-                cuda_read_se_det(d_se, R / 16u, c_sig, c_err);
+                if (is_tfq4) {
+                    float sm = (b == tfq4::TFQ4_BITS_225) ? tfq4::TRUE_E8P1024_BASE_SCALE : tfq4::TRUE_E8P_BASE_SCALE;
+                    uint32_t tfq4_ntg = (uint32_t)((((uint64_t)R * (C / 16u)) + 255ull) / 256ull);
+                    tfq4_enc::tfq4_finalize_scales_k<<<N_SC, 32>>>(d_ss, d_sc, N_SC, sm);
+                    if (b == tfq4::TFQ4_BITS_225) {
+                        tfq4_enc::tfq4_true_e8p_1024_encode_k<<<tfq4_ntg, 256>>>(
+                            d_rot, d_sc, reinterpret_cast<const uint4*>(d_e8p_lut), d_pack, d_tfq4_met, R, C);
+                    } else {
+                        tfq4_enc::tfq4_true_e8p_encode_k<<<tfq4_ntg, 256>>>(
+                            d_rot, d_sc, d_e8p_lut, d_pack, d_tfq4_met, R, C);
+                    }
+                    TFQ_CUDA_CHECK(cudaDeviceSynchronize());
+                    TFQ_CUDA_CHECK(cudaMemcpy(h_tfq4_met.data(), d_tfq4_met, (size_t)tfq4_ntg * 2ULL * 4ULL, cudaMemcpyDeviceToHost));
+                    for (uint32_t s = 0; s < tfq4_ntg; ++s) { c_sig += (double)h_tfq4_met[2u * s]; c_err += (double)h_tfq4_met[2u * s + 1u]; }
+                } else {
+                    finalize_scales_and_pack_nax_kernel<<<dim3(R / 16u, C / 128u, 1), 32>>>(d_rot, d_ss, d_sc, d_str, mp);
+                    uint32_t n_str = (R / 16u) * 32u;
+                    for (uint32_t off = 0; off < n_str; off += CHUNK_STR) {
+                        uint32_t cnt = std::min(CHUNK_STR, n_str - off);
+                        launch_prism_encode(b, cnt, d_str, d_lut[b], d_c64[b], d_grid[b], d_hist, d_pack, EncParams{R, C, b, off, cnt});
+                    }
+                    prism_verify_v3_snr_kernel<<<R / 16u, 32>>>(d_pack, d_sc, d_lut[b], d_c64[b], d_rot, d_se, mp);
+                    TFQ_CUDA_CHECK(cudaDeviceSynchronize());
+                    cuda_read_se_det(d_se, R / 16u, c_sig, c_err);
+                }
                 float snr = (float)(10.0 * std::log10(c_sig / std::max(c_err, 1e-12)));
                 uint64_t w_off = (p == 0) ? metas[e].gate_word_off : (p == 1 ? metas[e].up_word_off : metas[e].down_word_off);
                 uint32_t s_off = (p == 0) ? metas[e].gate_sc_off   : (p == 1 ? metas[e].up_sc_off   : metas[e].down_sc_off);

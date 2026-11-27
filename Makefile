@@ -85,18 +85,18 @@ $(BUILD)/tfq3-flashnext-convert.metallib: src/converters/flashnext/convert.metal
 	$(METALLIB) $(BUILD)/flashnext.air -o $@
 	@rm -f $(BUILD)/flashnext.air
 
-$(BUILD)/tfq3-glm-convert: src/converters/glm/convert.mm src/converters/moe_heat_rank.hpp $(METAL_ENC_HDRS) | $(BUILD)
+$(BUILD)/tfq3-glm-convert: src/converters/glm/convert.mm src/converters/moe_heat_rank.hpp src/converters/tfq4/tfq4_format.hpp $(METAL_ENC_HDRS) | $(BUILD)
 	$(OBJCXX) $< -o $@
 
-$(BUILD)/tfq3-glm-convert.metallib: src/converters/glm/convert.metal src/converters/metal_encode_common.metal | $(BUILD)
+$(BUILD)/tfq3-glm-convert.metallib: src/converters/glm/convert.metal src/converters/metal_encode_common.metal src/converters/tfq4/tfq4_encode_common.metal | $(BUILD)
 	$(METAL) $(METAL_ENC_FLAGS) -c $< -o $(BUILD)/glm.air
 	$(METALLIB) $(BUILD)/glm.air -o $@
 	@rm -f $(BUILD)/glm.air
 
-$(BUILD)/tfq3-inkling2-convert: src/converters/inkling2/convert.mm src/converters/inkling2/ink2_common.hpp $(METAL_ENC_HDRS) | $(BUILD)
+$(BUILD)/tfq3-inkling2-convert: src/converters/inkling2/convert.mm src/converters/inkling2/ink2_common.hpp src/converters/tfq4/tfq4_format.hpp $(METAL_ENC_HDRS) | $(BUILD)
 	$(OBJCXX) $< -o $@
 
-$(BUILD)/tfq3-inkling2-convert.metallib: src/converters/inkling2/convert.metal src/converters/metal_encode_common.metal | $(BUILD)
+$(BUILD)/tfq3-inkling2-convert.metallib: src/converters/inkling2/convert.metal src/converters/metal_encode_common.metal src/converters/tfq4/tfq4_encode_common.metal | $(BUILD)
 	$(METAL) $(METAL_ENC_FLAGS) -c $< -o $(BUILD)/inkling2.air
 	$(METALLIB) $(BUILD)/inkling2.air -o $@
 	@rm -f $(BUILD)/inkling2.air
@@ -112,7 +112,7 @@ $(BUILD)/tfq3-metal-test.metallib: src/kernels/metal/tfq3_metal.metal | $(BUILD)
 $(BUILD)/tfq4-convert: src/converters/tfq4/convert.mm src/converters/tfq4/tfq4_format.hpp src/converters/generic/planner.hpp $(METAL_ENC_HDRS) | $(BUILD)
 	$(OBJCXX) $< -o $@
 
-$(BUILD)/tfq4-convert.metallib: src/converters/tfq4/convert.metal | $(BUILD)
+$(BUILD)/tfq4-convert.metallib: src/converters/tfq4/convert.metal src/converters/tfq4/tfq4_encode_common.metal | $(BUILD)
 	$(METAL) $(METAL_ENC_FLAGS) -c $< -o $(BUILD)/tfq4_convert.air
 	$(METALLIB) $(BUILD)/tfq4_convert.air -o $@
 	@rm -f $(BUILD)/tfq4_convert.air
@@ -130,7 +130,7 @@ $(BUILD)/tfq4-metal-test.metallib: src/kernels/metal/tfq4_metal.metal | $(BUILD)
 $(BUILD)/tfq3-generic-convert-cuda: src/converters/generic/convert.cu src/converters/generic/planner.hpp src/converters/cuda_encode_common.cuh $(METAL_ENC_HDRS) | $(BUILD)
 	$(NVCC) $(NVCC_ENC_FLAGS) $< -o $@
 
-$(BUILD)/tfq4-convert-cuda: src/converters/tfq4/convert.cu src/converters/tfq4/tfq4_format.hpp src/converters/generic/planner.hpp $(METAL_ENC_HDRS) | $(BUILD)
+$(BUILD)/tfq4-convert-cuda: src/converters/tfq4/convert.cu src/converters/tfq4/tfq4_format.hpp src/converters/tfq4/tfq4_encode_common.cuh src/converters/generic/planner.hpp $(METAL_ENC_HDRS) | $(BUILD)
 	$(NVCC) $(NVCC_ENC_FLAGS) $< -o $@
 
 $(BUILD)/tfq3-qwen27-convert-cuda: src/converters/qwen27/convert.cu src/converters/cuda_encode_common.cuh $(METAL_ENC_HDRS) | $(BUILD)
@@ -139,10 +139,10 @@ $(BUILD)/tfq3-qwen27-convert-cuda: src/converters/qwen27/convert.cu src/converte
 $(BUILD)/tfq3-flashnext-convert-cuda: src/converters/flashnext/convert.cu src/converters/flashnext/flashnext_common.hpp src/converters/cuda_encode_common.cuh src/converters/moe_heat_rank.hpp $(METAL_ENC_HDRS) | $(BUILD)
 	$(NVCC) $(NVCC_ENC_FLAGS) $< -o $@
 
-$(BUILD)/tfq3-glm-convert-cuda: src/converters/glm/convert.cu src/converters/cuda_encode_common.cuh src/converters/moe_heat_rank.hpp $(METAL_ENC_HDRS) | $(BUILD)
+$(BUILD)/tfq3-glm-convert-cuda: src/converters/glm/convert.cu src/converters/cuda_encode_common.cuh src/converters/moe_heat_rank.hpp src/converters/tfq4/tfq4_format.hpp src/converters/tfq4/tfq4_encode_common.cuh $(METAL_ENC_HDRS) | $(BUILD)
 	$(NVCC) $(NVCC_ENC_FLAGS) $< -o $@
 
-$(BUILD)/tfq3-inkling2-convert-cuda: src/converters/inkling2/convert.cu src/converters/inkling2/ink2_common.hpp src/converters/cuda_encode_common.cuh $(METAL_ENC_HDRS) | $(BUILD)
+$(BUILD)/tfq3-inkling2-convert-cuda: src/converters/inkling2/convert.cu src/converters/inkling2/ink2_common.hpp src/converters/cuda_encode_common.cuh src/converters/tfq4/tfq4_format.hpp src/converters/tfq4/tfq4_encode_common.cuh $(METAL_ENC_HDRS) | $(BUILD)
 	$(NVCC) $(NVCC_ENC_FLAGS) $< -o $@
 
 $(BUILD)/tfq3-ernie-convert-cuda: src/converters/ernie/convert.cu src/converters/cuda_encode_common.cuh $(METAL_ENC_HDRS) | $(BUILD)
@@ -172,6 +172,7 @@ test: all
 	@python3 tests/vectors_test.py
 	@python3 tests/e2e_test.py
 	@python3 tests/inkling2_test.py
+	@python3 tests/test_tfq4_225_hybrid.py
 	@if [ "$(UNAME_S)" = "Darwin" ] && [ -x "$(BUILD)/tfq3-metal-test" ]; then $(BUILD)/tfq3-metal-test; fi
 	@if [ "$(UNAME_S)" = "Darwin" ] && [ -x "$(BUILD)/tfq4-metal-test" ]; then $(BUILD)/tfq4-metal-test; fi
 	@if [ "$(UNAME_S)" != "Darwin" ] && [ -x "$(BUILD)/tfq3-cuda-test" ]; then $(BUILD)/tfq3-cuda-test; fi

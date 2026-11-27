@@ -331,8 +331,12 @@ TFQ4_VER = 4
 PWV4_TABLE_LEGACY_TRAINED = 0
 PWV4_TABLE_TRAINED = 1
 PWV4_TABLE_TRUE_E8P = 2
-PWV4_TABLE_MAX_KNOWN = 2
+PWV4_TABLE_TRUE_E8P_1024 = 3
+PWV4_TABLE_MAX_KNOWN = 3
 TRUE_E8P_BASE_SCALE = 0.97
+TRUE_E8P1024_BASE_SCALE = 0.84
+TFQ4_BITS_200 = 2
+TFQ4_BITS_225 = 225
 
 
 def nearest_e8_quarter(x: np.ndarray) -> np.ndarray:
@@ -370,19 +374,55 @@ def build_true_e8p_abs_codebook() -> tuple[np.ndarray, np.ndarray]:
     return abs_cb, m_par
 
 
+def build_true_e8p_1024_abs_codebook() -> tuple[np.ndarray, np.ndarray]:
+    """Deterministic 1024-entry |D_8 + 1/2| base codebook for PWV4 table_kind=3 (True QuIP# E8P-1024, 2.251 bpw).
+
+    Enumerates all m_d in {0, 1, 2, 3} (4^8 = 65536 tuples), keeps sum((2*m_d + 1)^2) <= 68,
+    sorts by (n2_x4, max_m, lex m), and takes the first 1024 entries.
+    The first 256 entries are 100% bit-identical to `build_true_e8p_abs_codebook()` (table_kind=2).
+    Returns `(abs_cb [1024, 8] float32, m_parity [1024] uint8)` matching `tfq4::build_true_e8p_1024_tables`.
+    """
+    cands = []
+    for code in range(4**8):
+        tmp = code
+        m = [0] * 8
+        n2_x4 = 0
+        mx = 0
+        for d in range(7, -1, -1):
+            md = tmp & 3
+            tmp >>= 2
+            m[d] = md
+            v2 = 2 * md + 1
+            n2_x4 += v2 * v2
+            if md > mx:
+                mx = md
+        if n2_x4 <= 68:
+            cands.append((n2_x4, mx, tuple(m)))
+    cands.sort()
+    top = cands[:1024]
+    abs_cb = np.array([[md + 0.5 for md in tup] for _, _, tup in top], dtype=np.float32)
+    m_par = np.array([sum(tup) & 1 for _, _, tup in top], dtype=np.uint8)
+    return abs_cb, m_par
+
+
 def true_e8p_abs_parity(abs_cb: np.ndarray) -> np.ndarray:
-    """Derive the intrinsic mod-2 parity bit of each row in a table_kind=2 half-integer LUT."""
+    """Derive the intrinsic mod-2 parity bit of each row in a table_kind=2/3 half-integer LUT."""
     return (np.sum(np.rint(abs_cb - 0.5).astype(np.int64), axis=1) & 1).astype(np.uint8)
 
 
 def write_pwv4_tables(path: str, lut: np.ndarray, table_kind: int = PWV4_TABLE_LEGACY_TRAINED) -> None:
-    """Write a 16,384-byte PWV4 v4 codebook file with explicit `table_kind`."""
+    """Write a PWV4 v4 codebook file (16,384 B for kind=0/1/2; 32,768 B for kind=3)."""
     if table_kind < 0 or table_kind > PWV4_TABLE_MAX_KNOWN:
         raise ValueError(f"Unsupported PWV4 table_kind={table_kind}")
-    assert lut.shape == (256, 8)
-    buf = bytearray(16384)
-    struct.pack_into("<IIIII", buf, 0, MAGIC_PWV4, TFQ4_VER, 256, 8, int(table_kind))
-    lut_f16 = np.ascontiguousarray(lut, dtype=np.float16)
+    if table_kind == PWV4_TABLE_TRUE_E8P_1024:
+        assert lut.shape == (1024, 8), f"Expected (1024, 8) LUT for table_kind=3, got {lut.shape}"
+        buf = bytearray(32768)
+        struct.pack_into("<IIIII", buf, 0, MAGIC_PWV4, TFQ4_VER, 1024, 8, int(table_kind))
+    else:
+        assert lut.shape == (256, 8), f"Expected (256, 8) LUT for table_kind={table_kind}, got {lut.shape}"
+        buf = bytearray(16384)
+        struct.pack_into("<IIIII", buf, 0, MAGIC_PWV4, TFQ4_VER, 256, 8, int(table_kind))
+    lut_f16 = np.ascontiguousarray(lut, dtype="<f2")
     buf[64 : 64 + lut_f16.nbytes] = lut_f16.tobytes()
     with open(path, "wb") as f:
         f.write(buf)
@@ -401,16 +441,71 @@ def decode_true_e8p_codes(codes_u16: np.ndarray, abs_cb: np.ndarray) -> np.ndarr
     idx = (codes & np.uint32(0xFF)).astype(np.int32)
     s7 = (codes >> np.uint32(8)) & np.uint32(0x7F)
     coset = (codes >> np.uint32(15)) & np.uint32(1)
+    return decode_true_e8p_1024_codes(idx, s7, coset, abs_cb)
+
+
+def decode_true_e8p_1024_codes(
+    abs_idx: np.ndarray, s7: np.ndarray, coset: np.ndarray, abs_cb: np.ndarray
+) -> np.ndarray:
+    """Decode (abs_idx [0..1023], s7 [0..127], coset [0..1]) True E8P/E8P-1024 codes to E_8 + 1/4."""
+    idx = np.asarray(abs_idx, dtype=np.int32)
+    s7_u = np.asarray(s7, dtype=np.uint32) & np.uint32(0x7F)
+    cos_u = np.asarray(coset, dtype=np.uint32) & np.uint32(1)
     m_par = true_e8p_abs_parity(abs_cb).astype(np.uint32)
-    pc = np.zeros_like(s7)
+    pc = np.zeros_like(s7_u)
     for b in range(7):
-        pc ^= (s7 >> np.uint32(b)) & np.uint32(1)
+        pc ^= (s7_u >> np.uint32(b)) & np.uint32(1)
     s_bit7 = (pc ^ m_par[idx]) & np.uint32(1)
-    sm8 = s7 | (s_bit7 << np.uint32(7))
+    sm8 = s7_u | (s_bit7 << np.uint32(7))
     bits_mask = (sm8[..., None] >> np.arange(8, dtype=np.uint32)) & np.uint32(1)
     sgn = np.where(bits_mask != 0, -1.0, 1.0).astype(np.float32)
     q = abs_cb[idx] * sgn - np.float32(0.25)
-    return np.where(coset[..., None] != 0, -q, q).astype(np.float32)
+    return np.where(cos_u[..., None] != 0, -q, q).astype(np.float32)
+
+
+def pack_e8p_1024_words(abs_idx: np.ndarray, s7: np.ndarray, coset: np.ndarray) -> np.ndarray:
+    """Pack [R, C//8] E8P-1024 code fields into [R, (C//128)*9] uint32 words (2.25 bpw ABI)."""
+    R, n_vec = abs_idx.shape
+    assert n_vec % 16 == 0, f"Vector columns ({n_vec}) must be a multiple of 16"
+    n_bc = n_vec // 16
+    idx_u = np.asarray(abs_idx, dtype=np.uint32).reshape(R, n_bc, 16)
+    s7_u = (np.asarray(s7, dtype=np.uint32) & np.uint32(0x7F)).reshape(R, n_bc, 16)
+    cos_u = (np.asarray(coset, dtype=np.uint32) & np.uint32(1)).reshape(R, n_bc, 16)
+
+    low16 = (idx_u & np.uint32(0xFF)) | (s7_u << np.uint32(8)) | (cos_u << np.uint32(15))
+    hi2 = (idx_u >> np.uint32(8)) & np.uint32(0x3)
+
+    words = np.empty((R, n_bc, 9), dtype=np.uint32)
+    words[:, :, :8] = low16[:, :, 0::2] | (low16[:, :, 1::2] << np.uint32(16))
+    shifts = (np.arange(16, dtype=np.uint32) * np.uint32(2))[None, None, :]
+    words[:, :, 8] = np.bitwise_or.reduce(hi2 << shifts, axis=2)
+    return words.reshape(R, n_bc * 9)
+
+
+def unpack_e8p_1024_words(words_u32: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Unpack [R, (C//128)*9] uint32 words into (abs_idx, s7, coset) each [R, C//8] uint32."""
+    R, wpr = words_u32.shape
+    assert wpr % 9 == 0, f"E8P-1024 words_per_row ({wpr}) must be a multiple of 9"
+    n_bc = wpr // 9
+    blk = np.asarray(words_u32, dtype=np.uint32).reshape(R, n_bc, 9)
+    low16 = np.empty((R, n_bc, 16), dtype=np.uint32)
+    low16[:, :, 0::2] = blk[:, :, :8] & np.uint32(0xFFFF)
+    low16[:, :, 1::2] = blk[:, :, :8] >> np.uint32(16)
+    shifts = (np.arange(16, dtype=np.uint32) * np.uint32(2))[None, None, :]
+    hi2 = (blk[:, :, 8:9] >> shifts) & np.uint32(0x3)
+
+    abs_idx = (low16 & np.uint32(0xFF)) | (hi2 << np.uint32(8))
+    s7 = (low16 >> np.uint32(8)) & np.uint32(0x7F)
+    coset = (low16 >> np.uint32(15)) & np.uint32(1)
+    return abs_idx.reshape(R, n_bc * 16), s7.reshape(R, n_bc * 16), coset.reshape(R, n_bc * 16)
+
+
+def decode_true_e8p_1024_words(words_u32: np.ndarray, abs_cb: np.ndarray) -> np.ndarray:
+    """Decode [R, (C//128)*9] packed 2.25 bpw uint32 words to [R, C] float32 rotated weights."""
+    R, wpr = words_u32.shape
+    C = (wpr // 9) * 128
+    abs_idx, s7, coset = unpack_e8p_1024_words(words_u32)
+    return decode_true_e8p_1024_codes(abs_idx, s7, coset, abs_cb).reshape(R, C)
 
 
 def quant_true_e8p_e8_quarter(
@@ -483,29 +578,130 @@ def quant_true_e8p_e8_quarter(
     return out, codes_out, scales_out
 
 
+def quant_true_e8p_1024_e8_quarter(
+    W_rot: np.ndarray, abs_cb: np.ndarray, base_scale: float = TRUE_E8P1024_BASE_SCALE, ls_refine: bool = False
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Exact nearest-point encoder for True QuIP# E8P-1024 (table_kind=3, 262,144 points in E_8 + 1/4, 2.251 bpw).
+
+    Returns `(W_rot_hat [R, C] f32, words_u32 [R, (C//128)*9] u32, scales_f16 [R//128, C//128] f16)`.
+    """
+    R, C = W_rot.shape
+    assert R % 128 == 0 and C % 128 == 0
+    assert abs_cb.shape == (1024, 8)
+    n_br, n_bc = R // 128, C // 128
+    m_par = true_e8p_abs_parity(abs_cb).astype(np.int64)
+    cb64 = abs_cb.astype(np.float64)
+    cb_n2 = np.sum(cb64 * cb64, axis=1)
+
+    out = np.empty((R, C), dtype=np.float32)
+    all_idx = np.empty((R, C // 8), dtype=np.uint32)
+    all_s7 = np.empty((R, C // 8), dtype=np.uint32)
+    all_cos = np.empty((R, C // 8), dtype=np.uint32)
+    scales_out = np.empty((n_br, n_bc), dtype=np.float16)
+
+    for br in range(n_br):
+        for bc in range(n_bc):
+            blk = W_rot[br * 128 : (br + 1) * 128, bc * 128 : (bc + 1) * 128].astype(np.float64)
+            rms = math.sqrt(float(np.mean(blk * blk)) + 1e-12)
+            sc_f16 = np.float16(rms * base_scale)
+            sc_eff = float(sc_f16)
+            V = (blk / max(sc_eff, 1e-12)).reshape(-1, 8)  # [2048, 8]
+            N = V.shape[0]
+            best_dist = np.full(N, np.inf, dtype=np.float64)
+            best_k = np.zeros(N, dtype=np.uint32)
+            best_s7 = np.zeros(N, dtype=np.uint32)
+            best_cos = np.zeros(N, dtype=np.uint32)
+
+            for s0 in range(0, N, 256):
+                s1 = min(s0 + 256, N)
+                Vc = V[s0:s1]
+                Nc = s1 - s0
+                bd_c = best_dist[s0:s1]
+                bk_c = best_k[s0:s1]
+                bs_c = best_s7[s0:s1]
+                bc_c = best_cos[s0:s1]
+                for coset in (0, 1):
+                    Z = (Vc + 0.25) if coset == 0 else (-Vc + 0.25)
+                    aZ = np.abs(Z)
+                    nb = (Z < 0.0).astype(np.int64)
+                    zp = np.sum(nb, axis=1) & 1
+                    zn2 = np.sum(Z * Z, axis=1)
+                    prod = aZ[:, None, :] * cb64[None, :, :]
+                    dot = np.sum(prod, axis=2)
+                    min_p = np.min(prod, axis=2)
+                    nf = zp[:, None] != m_par[None, :]
+                    adj = dot - np.where(nf, 2.0 * min_p, 0.0)
+                    dist = zn2[:, None] + cb_n2[None, :] - 2.0 * adj
+                    kb = np.argmin(dist, axis=1)
+                    db = dist[np.arange(Nc), kb]
+                    better = db < bd_c
+                    if np.any(better):
+                        bi = np.nonzero(better)[0]
+                        kbi = kb[bi]
+                        nb_sel = nb[bi].copy()
+                        nfi = np.nonzero(nf[bi, kbi])[0]
+                        if len(nfi):
+                            fd = np.argmin(prod[bi[nfi], kbi[nfi]], axis=1)
+                            nb_sel[nfi, fd] ^= 1
+                        s7 = (
+                            (nb_sel[:, 0] << 0) | (nb_sel[:, 1] << 1) | (nb_sel[:, 2] << 2) | (nb_sel[:, 3] << 3)
+                            | (nb_sel[:, 4] << 4) | (nb_sel[:, 5] << 5) | (nb_sel[:, 6] << 6)
+                        )
+                        bd_c[bi] = db[bi]
+                        bk_c[bi] = kbi.astype(np.uint32)
+                        bs_c[bi] = s7.astype(np.uint32)
+                        bc_c[bi] = np.uint32(coset)
+
+            q_raw = decode_true_e8p_1024_codes(best_k, best_s7, best_cos, abs_cb).reshape(128, 128)
+            if ls_refine:
+                alpha = float(np.sum(blk * q_raw.astype(np.float64)) / max(float(np.sum(q_raw.astype(np.float64) ** 2)), 1e-12))
+                sc_f16 = np.float16(alpha)
+                sc_eff = float(sc_f16)
+            scales_out[br, bc] = sc_f16
+            all_idx[br * 128 : (br + 1) * 128, bc * 16 : (bc + 1) * 16] = best_k.reshape(128, 16)
+            all_s7[br * 128 : (br + 1) * 128, bc * 16 : (bc + 1) * 16] = best_s7.reshape(128, 16)
+            all_cos[br * 128 : (br + 1) * 128, bc * 16 : (bc + 1) * 16] = best_cos.reshape(128, 16)
+            out[br * 128 : (br + 1) * 128, bc * 128 : (bc + 1) * 128] = (q_raw * np.float32(sc_eff)).astype(np.float32)
+
+    words_out = pack_e8p_1024_words(all_idx, all_s7, all_cos)
+    return out, words_out, scales_out
+
+
 def load_pwv4_tables_with_kind(path: str) -> tuple[np.ndarray, int]:
-    """Load and validate a 16 KiB `pw_v4_e8p_tables.bin` codebook, returning `(lut [256, 8] f32, table_kind)`."""
+    """Load and validate a PWV4 codebook (16 KiB kind=0/1/2 or 32 KiB kind=3), returning `(lut [K, 8] f32, table_kind)`."""
     raw = open(path, "rb").read()
-    if len(raw) != 16384:
-        raise ValueError(f"Expected 16384-byte PWV4 file, got {len(raw)}")
+    if len(raw) < 64:
+        raise ValueError(f"Truncated PWV4 file ({len(raw)} bytes)")
     magic, ver, k_codes, dim, table_kind = struct.unpack_from("<IIIII", raw, 0)
-    if magic != MAGIC_PWV4 or ver != TFQ4_VER or k_codes != 256 or dim != 8:
+    if magic != MAGIC_PWV4 or ver != TFQ4_VER or dim != 8:
         raise ValueError(f"Bad PWV4 header: magic=0x{magic:08x} ver={ver} k={k_codes} dim={dim}")
     if table_kind > PWV4_TABLE_MAX_KNOWN:
-        raise ValueError(f"Unknown PWV4 table_kind={table_kind} (supported: 0/1=trained, 2=true-E8P)")
-    lut = np.frombuffer(raw, dtype=np.float16, count=256 * 8, offset=64).reshape(256, 8).astype(np.float32)
+        raise ValueError(f"Unknown PWV4 table_kind={table_kind} (supported: 0/1=trained, 2=true-E8P, 3=true-E8P-1024)")
+    if table_kind == PWV4_TABLE_TRUE_E8P_1024:
+        if len(raw) != 32768 or k_codes != 1024:
+            raise ValueError(
+                f"PWV4 table_kind={table_kind} requires 32768-byte file with k_codes=1024 "
+                f"(got {len(raw)} bytes, k_codes={k_codes})"
+            )
+    else:
+        if len(raw) != 16384 or k_codes != 256:
+            raise ValueError(
+                f"Expected 16384-byte PWV4 file with k_codes=256 for table_kind={table_kind}, "
+                f"got {len(raw)} bytes, k_codes={k_codes}"
+            )
+    lut = np.frombuffer(raw, dtype="<f2", count=k_codes * 8, offset=64).reshape(k_codes, 8).astype(np.float32)
     if not np.all(np.isfinite(lut)) or np.any(lut < 0.0):
         raise ValueError("PWV4 e8p_lut contains non-finite or negative entries")
-    if table_kind == PWV4_TABLE_TRUE_E8P:
+    if table_kind in (PWV4_TABLE_TRUE_E8P, PWV4_TABLE_TRUE_E8P_1024):
         two_v = lut * 2.0
         r = np.rint(two_v)
         if np.any(lut < 0.5) or np.any(np.abs(two_v - r) > 1e-3) or np.any((r.astype(np.int64) & 1) == 0):
-            raise ValueError("PWV4 table_kind=2 (true-E8P) LUT entries must be positive odd half-integers")
+            raise ValueError(f"PWV4 table_kind={table_kind} (true-E8P) LUT entries must be positive odd half-integers")
     return lut, int(table_kind)
 
 
 def load_pwv4_tables(path: str) -> np.ndarray:
-    """Load and validate a 16 KiB `pw_v4_e8p_tables.bin` codebook (`float32` [256, 8])."""
+    """Load and validate a `pw_v4_e8p_tables.bin` codebook (`float32` [256, 8] or [1024, 8])."""
     lut, _ = load_pwv4_tables_with_kind(path)
     return lut
 
@@ -513,7 +709,7 @@ def load_pwv4_tables(path: str) -> np.ndarray:
 def dequantize_tfp4_tensor(
     shard_path: str, tables_path: str, tensor_name: str, max_blocks: int | None = None, verify_checksum: bool = True
 ) -> np.ndarray:
-    """Dequantize a TFP4 v4 (2.001 bpw E8P) tensor (or its top-left tiles) to float32."""
+    """Dequantize a TFP4 v4 (2.001 bpw or 2.251 bpw E8P) tensor (or its top-left tiles) to float32."""
     lut, table_kind = load_pwv4_tables_with_kind(tables_path)
     with open(shard_path, "rb") as f:
         hdr = struct.unpack("<IIIIQQQQQQ", f.read(64))
@@ -535,7 +731,7 @@ def dequantize_tfp4_tensor(
         if found is None:
             raise KeyError(f"Tensor {tensor_name} not in {shard_path}")
         R, C, bits, sc_off, w_off, w_cnt, _, _, _, _ = found
-        if bits != 2:
+        if bits not in (TFQ4_BITS_200, TFQ4_BITS_225):
             raise ValueError(f"Unexpected TFP4 bits={bits} for {tensor_name}")
         n_br, n_bc = R // 128, C // 128
         rb_lim = n_br if max_blocks is None else min(max_blocks, n_br)
@@ -543,22 +739,28 @@ def dequantize_tfp4_tensor(
         f.seek(off_scales + sc_off * 2)
         scales = np.frombuffer(f.read(n_br * n_bc * 2), dtype=np.float16).reshape(n_br, n_bc).astype(np.float32)
         f.seek(off_weights + w_off * 4)
-        words = np.frombuffer(f.read(w_cnt * 4), dtype=np.uint32).reshape(R, C // 16)
+        wpb = 9 if bits == TFQ4_BITS_225 else 8
+        words = np.frombuffer(f.read(w_cnt * 4), dtype=np.uint32).reshape(R, n_bc * wpb)
 
     rr, cc = rb_lim * 128, cb_lim * 128
-    sub_w = words[:rr, : cc // 16]
-    codes = np.empty((rr, cc // 8), dtype=np.uint16)
-    codes[:, 0::2] = (sub_w & np.uint32(0xFFFF)).astype(np.uint16)
-    codes[:, 1::2] = (sub_w >> np.uint32(16)).astype(np.uint16)
+    sub_w = words[:rr, : cb_lim * wpb]
 
-    if table_kind == PWV4_TABLE_TRUE_E8P:
-        W_rot = decode_true_e8p_codes(codes, lut).reshape(rr, cc)
+    if bits == TFQ4_BITS_225:
+        if table_kind != PWV4_TABLE_TRUE_E8P_1024:
+            raise ValueError(f"TFP4 2.25 bpw tensor {tensor_name} requires PWV4 table_kind=3, got {table_kind}")
+        W_rot = decode_true_e8p_1024_words(sub_w, lut)
     else:
-        k_idx = (codes & np.uint16(0xFF)).astype(np.int32)
-        sm = (codes >> np.uint16(8)).astype(np.uint32)
-        bits_mask = (sm[..., None] >> np.arange(8, dtype=np.uint32)) & np.uint32(1)
-        sgn = np.where(bits_mask != 0, -1.0, 1.0).astype(np.float32)
-        W_rot = (lut[k_idx] * sgn).reshape(rr, cc)
+        codes = np.empty((rr, cc // 8), dtype=np.uint16)
+        codes[:, 0::2] = (sub_w & np.uint32(0xFFFF)).astype(np.uint16)
+        codes[:, 1::2] = (sub_w >> np.uint32(16)).astype(np.uint16)
+        if table_kind in (PWV4_TABLE_TRUE_E8P, PWV4_TABLE_TRUE_E8P_1024):
+            W_rot = decode_true_e8p_codes(codes, lut[:256]).reshape(rr, cc)
+        else:
+            k_idx = (codes & np.uint16(0xFF)).astype(np.int32)
+            sm = (codes >> np.uint16(8)).astype(np.uint32)
+            bits_mask = (sm[..., None] >> np.arange(8, dtype=np.uint32)) & np.uint32(1)
+            sgn = np.where(bits_mask != 0, -1.0, 1.0).astype(np.float32)
+            W_rot = (lut[k_idx] * sgn).reshape(rr, cc)
     sc_tile = np.repeat(np.repeat(scales[:rb_lim, :cb_lim], 128, axis=0), 128, axis=1)
     return inv_fwht2d_128(W_rot * sc_tile)
 
@@ -602,7 +804,21 @@ def main():
         assert float(np.max(np.abs(pts - nearest_e8_quarter(pts)))) < 1e-5, "True E8P point outside E8 + 1/4!"
         s_k2 = snr_db(W, inv_fwht2d_128(W_rot_k2))
         assert s_k2 > 10.2, f"Unexpectedly low true-E8P SNR: {s_k2:.2f} dB"
-        print(f"PASS TFQ4-E8P self-test: FWHT max_err={err:.2e}, trained SNR={s:.2f} dB, true-E8P(kind=2) SNR={s_k2:.2f} dB")
+        # True QuIP# E8P-1024 (table_kind=3, 2.251 bpw, E8 + 1/4) exact pack/unpack + prefix identity + lattice check
+        e8p1024_cb, _ = build_true_e8p_1024_abs_codebook()
+        assert np.array_equal(e8p1024_cb[:256], e8p_cb), "First 256 entries of E8P-1024 must be bit-identical to E8P-256"
+        W_rot_k3, words_k3, sc_k3 = quant_true_e8p_1024_e8_quarter(W_rot, e8p1024_cb)
+        q_dec3 = decode_true_e8p_1024_words(words_k3, e8p1024_cb)
+        sc_tile3 = np.repeat(np.repeat(sc_k3.astype(np.float32), 128, axis=0), 128, axis=1)
+        assert float(np.max(np.abs(W_rot_k3 - q_dec3 * sc_tile3))) < 1e-5
+        pts3 = q_dec3.reshape(-1, 8)[:512]
+        assert float(np.max(np.abs(pts3 - nearest_e8_quarter(pts3)))) < 1e-5, "True E8P-1024 point outside E8 + 1/4!"
+        s_k3 = snr_db(W, inv_fwht2d_128(W_rot_k3))
+        assert s_k3 > 11.4, f"Unexpectedly low true-E8P-1024 SNR: {s_k3:.2f} dB"
+        print(
+            f"PASS TFQ4-E8P self-test: FWHT max_err={err:.2e}, trained SNR={s:.2f} dB, "
+            f"true-E8P(kind=2) SNR={s_k2:.2f} dB, true-E8P-1024(kind=3, 2.25b) SNR={s_k3:.2f} dB"
+        )
         return
 
     print("Building data-free D4 (256/512) and E8P (256/1024) universal Gaussian codebooks...")

@@ -1,4 +1,5 @@
-// Standalone Apple Silicon Metal TFQ4-E8P (2.001 bpw) Parity & Bandwidth Benchmark.
+// Standalone Apple Silicon Metal TFQ4-E8P (2.001 & 2.251 bpw) Parity & Bandwidth Benchmark.
+// Verifies table_kind=0 (trained 2.0b), table_kind=2 (True E8P 2.0b), and table_kind=3 (True E8P-1024 2.25b).
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #include <mach-o/dyld.h>
@@ -34,41 +35,53 @@ static void fwht128_f64(double* x) {
 }
 
 static std::vector<double> ref_dequant_e8p(
-    const uint32_t* W, const uint16_t* sc, const tfq4::PwV4E8Tables& T, uint32_t N, uint32_t K
+    const uint32_t* W, const uint16_t* sc, const uint16_t (*lut)[8],
+    uint32_t table_kind, uint32_t N, uint32_t K
 ) {
-    const bool is_true = (T.table_kind == tfq4::PWV4_TABLE_TRUE_E8P);
-    uint8_t m_par[256] = {};
+    const bool is_true = (table_kind == tfq4::PWV4_TABLE_TRUE_E8P || table_kind == tfq4::PWV4_TABLE_TRUE_E8P_1024);
+    const bool is_1024 = (table_kind == tfq4::PWV4_TABLE_TRUE_E8P_1024);
+    const uint32_t k_codes = is_1024 ? 1024u : 256u;
+    std::vector<uint8_t> m_par(k_codes, 0u);
     if (is_true) {
-        for (uint32_t k = 0; k < 256u; ++k) m_par[k] = tfq4::true_e8p_abs_parity(T.e8p_lut[k]);
+        for (uint32_t k = 0; k < k_codes; ++k) m_par[k] = tfq4::true_e8p_abs_parity(lut[k]);
     }
-    uint32_t n_bc = K / 128u, wpr = K / 16u;
+    const uint32_t n_bc = K / 128u;
+    const uint32_t wpb = is_1024 ? 9u : 8u;
+    const uint32_t wpr = n_bc * wpb;
     std::vector<double> Wrot((size_t)N * K, 0.0);
     for (uint32_t r = 0; r < N; ++r) {
         uint32_t br = r / 128u;
-        for (uint32_t w = 0; w < wpr; ++w) {
-            uint32_t bc = w / 8u;
+        for (uint32_t bc = 0; bc < n_bc; ++bc) {
             double fsc = (double)tfq4::f16_bits_to_f32(sc[(size_t)br * n_bc + bc]);
-            uint32_t packed = W[(size_t)r * wpr + w];
-            uint32_t c0 = packed & 0xFFFFu, c1 = packed >> 16;
-            for (int half_idx = 0; half_idx < 2; ++half_idx) {
-                uint32_t code = half_idx ? c1 : c0;
-                uint32_t idx = code & 255u;
-                if (is_true) {
-                    uint32_t s7 = (code >> 8) & 0x7Fu;
-                    uint32_t sm = s7 | (((static_cast<uint32_t>(__builtin_popcount(s7)) ^ m_par[idx]) & 1u) << 7);
-                    double c_sgn = (code & 0x8000u) ? -1.0 : 1.0;
-                    for (int d = 0; d < 8; ++d) {
-                        double mag = (double)tfq4::f16_bits_to_f32(T.e8p_lut[idx][d]);
-                        double sgn = ((sm >> d) & 1u) ? -1.0 : 1.0;
-                        double q = c_sgn * (mag * sgn - 0.25);
-                        Wrot[(size_t)r * K + w * 16u + half_idx * 8u + d] = q * fsc;
+            const uint32_t* blk = W + (size_t)r * wpr + (size_t)bc * wpb;
+            uint32_t hi_word = is_1024 ? blk[8] : 0u;
+            for (uint32_t sw = 0; sw < 8u; ++sw) {
+                uint32_t packed = blk[sw];
+                uint32_t c0 = packed & 0xFFFFu, c1 = packed >> 16;
+                for (int half_idx = 0; half_idx < 2; ++half_idx) {
+                    uint32_t code = half_idx ? c1 : c0;
+                    uint32_t idx = code & 255u;
+                    if (is_1024) {
+                        uint32_t j = sw * 2u + (uint32_t)half_idx;
+                        idx |= ((hi_word >> (2u * j)) & 3u) << 8;
                     }
-                } else {
-                    uint32_t sm = code >> 8;
-                    for (int d = 0; d < 8; ++d) {
-                        double mag = (double)tfq4::f16_bits_to_f32(T.e8p_lut[idx][d]);
-                        double sgn = ((sm >> d) & 1u) ? -1.0 : 1.0;
-                        Wrot[(size_t)r * K + w * 16u + half_idx * 8u + d] = mag * sgn * fsc;
+                    if (is_true) {
+                        uint32_t s7 = (code >> 8) & 0x7Fu;
+                        uint32_t sm = s7 | (((static_cast<uint32_t>(__builtin_popcount(s7)) ^ m_par[idx]) & 1u) << 7);
+                        double c_sgn = (code & 0x8000u) ? -1.0 : 1.0;
+                        for (int d = 0; d < 8; ++d) {
+                            double mag = (double)tfq4::f16_bits_to_f32(lut[idx][d]);
+                            double sgn = ((sm >> d) & 1u) ? -1.0 : 1.0;
+                            double q = c_sgn * (mag * sgn - 0.25);
+                            Wrot[(size_t)r * K + bc * 128u + sw * 16u + half_idx * 8u + d] = q * fsc;
+                        }
+                    } else {
+                        uint32_t sm = code >> 8;
+                        for (int d = 0; d < 8; ++d) {
+                            double mag = (double)tfq4::f16_bits_to_f32(lut[idx][d]);
+                            double sgn = ((sm >> d) & 1u) ? -1.0 : 1.0;
+                            Wrot[(size_t)r * K + bc * 128u + sw * 16u + half_idx * 8u + d] = mag * sgn * fsc;
+                        }
                     }
                 }
             }
@@ -119,7 +132,8 @@ int main(int argc, char** argv) {
         id<MTLComputePipelineState> pso_fx = mk("tfq4_fwht_x");
         id<MTLComputePipelineState> pso_e8 = mk("tfq4_e8p_dense");
         id<MTLComputePipelineState> pso_e8_true = mk("tfq4_true_e8p_dense");
-        if (!pso_fx || !pso_e8 || !pso_e8_true) {
+        id<MTLComputePipelineState> pso_e8_1024 = mk("tfq4_true_e8p_1024_dense");
+        if (!pso_fx || !pso_e8 || !pso_e8_true || !pso_e8_1024) {
             fprintf(stderr, "Failed to create Metal compute pipelines: %s\n", err ? [[err localizedDescription] UTF8String] : "unknown");
             return 1;
         }
@@ -132,15 +146,30 @@ int main(int argc, char** argv) {
             if (fread(hdr, 4, 2, vf) != 2 || hdr[0] != 0x56454334u) {
                 fprintf(stderr, "Bad VEC4 header in %s\n", vec_path.c_str()); fclose(vf); return 1;
             }
-            tfq4::PwV4E8Tables vtbl{};
-            if (fread(&vtbl, 1, sizeof(vtbl), vf) != sizeof(vtbl)) { fprintf(stderr, "Truncated VEC4 tables\n"); fclose(vf); return 1; }
-            if (vtbl.magic != tfq4::MAGIC_PWV4 || vtbl.version != tfq4::FORMAT_VER || vtbl.table_kind > tfq4::PWV4_TABLE_MAX_KNOWN) {
-                fprintf(stderr, "Unsupported PWV4 table in VEC4 bundle: magic=0x%08x ver=%u table_kind=%u\n",
-                        vtbl.magic, vtbl.version, vtbl.table_kind);
+            uint32_t thdr[16] = {};
+            if (fread(thdr, 4, 16, vf) != 16) { fprintf(stderr, "Truncated VEC4 table header\n"); fclose(vf); return 1; }
+            const uint32_t magic = thdr[0], ver = thdr[1], k_codes = thdr[2], dim = thdr[3], table_kind = thdr[4];
+            if (magic != tfq4::MAGIC_PWV4 || ver != tfq4::FORMAT_VER || dim != 8u || table_kind > tfq4::PWV4_TABLE_MAX_KNOWN) {
+                fprintf(stderr, "Unsupported PWV4 table in VEC4 bundle: magic=0x%08x ver=%u table_kind=%u\n", magic, ver, table_kind);
                 fclose(vf); return 1;
             }
-            id<MTLComputePipelineState> pso_vec = (vtbl.table_kind == tfq4::PWV4_TABLE_TRUE_E8P) ? pso_e8_true : pso_e8;
-            id<MTLBuffer> blut = [dev newBufferWithBytes:vtbl.e8p_lut length:sizeof(vtbl.e8p_lut) options:MTLResourceStorageModeShared];
+            const bool is_1024 = (table_kind == tfq4::PWV4_TABLE_TRUE_E8P_1024);
+            if ((is_1024 && k_codes != 1024u) || (!is_1024 && k_codes != 256u)) {
+                fprintf(stderr, "Mismatched k_codes=%u for table_kind=%u in VEC4 bundle\n", k_codes, table_kind);
+                fclose(vf); return 1;
+            }
+            const size_t tbl_bytes = is_1024 ? sizeof(tfq4::PwV4E8Tables1024) : sizeof(tfq4::PwV4E8Tables);
+            const size_t lut_bytes = (size_t)k_codes * 8u * 2u;
+            std::vector<uint8_t> tbl_rest(tbl_bytes - 64u);
+            if (fread(tbl_rest.data(), 1, tbl_rest.size(), vf) != tbl_rest.size()) {
+                fprintf(stderr, "Truncated VEC4 tables\n"); fclose(vf); return 1;
+            }
+            id<MTLComputePipelineState> pso_vec = is_1024
+                ? pso_e8_1024
+                : ((table_kind == tfq4::PWV4_TABLE_TRUE_E8P) ? pso_e8_true : pso_e8);
+            id<MTLBuffer> blut = [dev newBufferWithBytes:tbl_rest.data() length:lut_bytes options:MTLResourceStorageModeShared];
+            const uint32_t wpb = is_1024 ? 9u : 8u;
+
             for (uint32_t ci = 0; ci < hdr[1]; ++ci) {
                 uint32_t ch[10] = {};
                 if (fread(ch, 4, 10, vf) != 10) { fprintf(stderr, "Truncated VEC4 case %u\n", ci); fclose(vf); return 1; }
@@ -156,10 +185,12 @@ int main(int argc, char** argv) {
                     fread(Y_ref.data(), 4, Y_ref.size(), vf) != Y_ref.size()) {
                     fprintf(stderr, "Truncated VEC4 payload case %u\n", ci); fclose(vf); return 1;
                 }
-                // Extract contiguous [n_loc, k_loc/16] weight slice & [n_loc/128, k_loc/128] scale slice for offset case
-                std::vector<uint32_t> W_loc((size_t)n_loc * (k_loc / 16u));
+                const uint32_t full_wpr = (C / 128u) * wpb;
+                const uint32_t loc_wpr  = (k_loc / 128u) * wpb;
+                const uint32_t c_w_off  = (c_off / 128u) * wpb;
+                std::vector<uint32_t> W_loc((size_t)n_loc * loc_wpr);
                 for (uint32_t r = 0; r < n_loc; ++r) {
-                    memcpy(&W_loc[(size_t)r * (k_loc / 16u)], &W[(size_t)(r_off + r) * (C / 16u) + (c_off / 16u)], (k_loc / 16u) * 4u);
+                    memcpy(&W_loc[(size_t)r * loc_wpr], &W[(size_t)(r_off + r) * full_wpr + c_w_off], (size_t)loc_wpr * 4u);
                 }
                 std::vector<uint16_t> sc_loc((size_t)(n_loc / 128u) * (k_loc / 128u));
                 for (uint32_t br = 0; br < n_loc / 128u; ++br) {
@@ -191,52 +222,67 @@ int main(int argc, char** argv) {
                 double cos_v = dot / (std::sqrt(na * nb) + 1e-30);
                 if (cos_v < 0.99998) {
                     fprintf(stderr, "FAIL Metal VEC4 table_kind=%u case=%u r_off=%u c_off=%u cos=%.8f\n",
-                            vtbl.table_kind, ci, r_off, c_off, cos_v);
+                            table_kind, ci, r_off, c_off, cos_v);
                     fclose(vf); return 1;
                 }
             }
             fclose(vf);
             printf("PASS Metal TFQ4 golden vectors (table_kind=%u, %u cases, including r_off & c_off offsets)\n",
-                   vtbl.table_kind, hdr[1]);
+                   table_kind, hdr[1]);
             return 0;
         }
 
         tfq4::PwV4E8Tables h_tbl_trained{}, h_tbl_true{};
+        tfq4::PwV4E8Tables1024 h_tbl_1024{};
         tfq4::build_e8p_tables(h_tbl_trained);
         tfq4::build_true_e8p_tables(h_tbl_true);
+        tfq4::build_true_e8p_1024_tables(h_tbl_1024);
+        if (std::memcmp(h_tbl_true.e8p_lut, h_tbl_1024.e8p_lut, sizeof(h_tbl_true.e8p_lut)) != 0) {
+            fprintf(stderr, "FAIL: first 256 entries of PwV4E8Tables1024 diverge from PwV4E8Tables (table_kind=2)\n");
+            return 1;
+        }
         id<MTLBuffer> b_lut_trained = [dev newBufferWithBytes:h_tbl_trained.e8p_lut length:sizeof(h_tbl_trained.e8p_lut) options:MTLResourceStorageModeShared];
         id<MTLBuffer> b_lut_true = [dev newBufferWithBytes:h_tbl_true.e8p_lut length:sizeof(h_tbl_true.e8p_lut) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> b_lut_1024 = [dev newBufferWithBytes:h_tbl_1024.e8p_lut length:sizeof(h_tbl_1024.e8p_lut) options:MTLResourceStorageModeShared];
 
-        // 1. Exact fp64 parity + bit-exact rows=1 == rows=16 (and rows=17) + fp16 saturation for BOTH table_kind=0 and table_kind=2
+        // 1. Exact fp64 parity + bit-exact rows=1 == rows=16 == rows=17 + fp16 saturation for kind=0, 2, and 3
         const uint32_t N = 512u, K = 1024u, MAX_R = 17u;
         std::mt19937 rng(777);
-        std::vector<uint32_t> h_W((size_t)N * (K / 16u));
+        std::vector<uint32_t> h_W20((size_t)N * (K / 16u));
+        std::vector<uint32_t> h_W225((size_t)N * (K / 128u) * 9u);
         std::vector<uint16_t> h_sc((size_t)(N / 128u) * (K / 128u)), h_X((size_t)MAX_R * K);
-        for (auto& w : h_W) w = rng();
+        for (auto& w : h_W20) w = rng();
+        for (auto& w : h_W225) w = rng();
         for (auto& s : h_sc) s = tfq4::f32_to_f16_bits(0.03f + 0.02f * ((float)(rng() & 255u) / 255.0f));
         for (auto& x : h_X) x = tfq4::f32_to_f16_bits(((int)(rng() % 201u) - 100) * 0.01f);
 
-        id<MTLBuffer> b_W = [dev newBufferWithBytes:h_W.data() length:h_W.size() * 4 options:MTLResourceStorageModeShared];
-        id<MTLBuffer> b_sc = [dev newBufferWithBytes:h_sc.data() length:h_sc.size() * 2 options:MTLResourceStorageModeShared];
-        id<MTLBuffer> b_X = [dev newBufferWithBytes:h_X.data() length:h_X.size() * 2 options:MTLResourceStorageModeShared];
-        id<MTLBuffer> b_xr = [dev newBufferWithLength:(size_t)MAX_R * K * 2 options:MTLResourceStorageModeShared];
-        id<MTLBuffer> b_Y = [dev newBufferWithLength:(size_t)MAX_R * N * 4 options:MTLResourceStorageModeShared];
+        id<MTLBuffer> b_W20  = [dev newBufferWithBytes:h_W20.data()  length:h_W20.size() * 4  options:MTLResourceStorageModeShared];
+        id<MTLBuffer> b_W225 = [dev newBufferWithBytes:h_W225.data() length:h_W225.size() * 4 options:MTLResourceStorageModeShared];
+        id<MTLBuffer> b_sc   = [dev newBufferWithBytes:h_sc.data()   length:h_sc.size() * 2   options:MTLResourceStorageModeShared];
+        id<MTLBuffer> b_X    = [dev newBufferWithBytes:h_X.data()    length:h_X.size() * 2    options:MTLResourceStorageModeShared];
+        id<MTLBuffer> b_xr   = [dev newBufferWithLength:(size_t)MAX_R * K * 2 options:MTLResourceStorageModeShared];
+        id<MTLBuffer> b_Y    = [dev newBufferWithLength:(size_t)MAX_R * N * 4 options:MTLResourceStorageModeShared];
 
         struct KindCfg {
             const char* name;
+            const char* rate_lbl;
             uint32_t kind;
-            const tfq4::PwV4E8Tables* tbl;
+            uint32_t wpb;
+            const uint16_t (*lut_host)[8];
+            const uint32_t* w_host;
+            id<MTLBuffer> bW;
             id<MTLBuffer> lut;
             id<MTLComputePipelineState> pso;
         };
         KindCfg kinds[] = {
-            {"trained/kind=0",  tfq4::PWV4_TABLE_LEGACY_TRAINED, &h_tbl_trained, b_lut_trained, pso_e8},
-            {"true-E8P/kind=2", tfq4::PWV4_TABLE_TRUE_E8P,       &h_tbl_true,    b_lut_true,    pso_e8_true},
+            {"trained/kind=0",       "2.00b", tfq4::PWV4_TABLE_LEGACY_TRAINED, 8u, h_tbl_trained.e8p_lut, h_W20.data(),  b_W20,  b_lut_trained, pso_e8},
+            {"true-E8P/kind=2",      "2.00b", tfq4::PWV4_TABLE_TRUE_E8P,       8u, h_tbl_true.e8p_lut,    h_W20.data(),  b_W20,  b_lut_true,    pso_e8_true},
+            {"true-E8P-1024/kind=3", "2.25b", tfq4::PWV4_TABLE_TRUE_E8P_1024,  9u, h_tbl_1024.e8p_lut,    h_W225.data(), b_W225, b_lut_1024,    pso_e8_1024},
         };
 
         for (auto& kc : kinds) {
             memcpy([b_X contents], h_X.data(), h_X.size() * 2);
-            auto W_ref = ref_dequant_e8p(h_W.data(), h_sc.data(), *kc.tbl, N, K);
+            auto W_ref = ref_dequant_e8p(kc.w_host, h_sc.data(), kc.lut_host, kc.kind, N, K);
 
             auto run = [&](uint32_t rows, std::vector<float>& out) {
                 MetalTfq4Params p{rows, N, K, K, N, 0, 0};
@@ -247,7 +293,7 @@ int main(int argc, char** argv) {
                 [enc setBytes:&p length:sizeof(p) atIndex:2];
                 [enc dispatchThreadgroups:MTLSizeMake(K / 128u, rows, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
                 [enc setComputePipelineState:kc.pso];
-                [enc setBuffer:b_W offset:0 atIndex:0]; [enc setBuffer:b_sc offset:0 atIndex:1];
+                [enc setBuffer:kc.bW offset:0 atIndex:0]; [enc setBuffer:b_sc offset:0 atIndex:1];
                 [enc setBuffer:kc.lut offset:0 atIndex:2]; [enc setBuffer:b_xr offset:0 atIndex:3];
                 [enc setBuffer:b_Y offset:0 atIndex:4]; [enc setBytes:&p length:sizeof(p) atIndex:5];
                 [enc dispatchThreadgroups:MTLSizeMake(N / 128u, (rows + 15u) / 16u, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
@@ -276,8 +322,8 @@ int main(int argc, char** argv) {
                 dot += g * ref; na += g * g; nb += ref * ref;
             }
             double cos_v = dot / (std::sqrt(na * nb) + 1e-30);
-            if (cos_v < 0.99999) {
-                fprintf(stderr, "FAIL TFQ4 Metal (%s) fp64 parity cos=%.8f\n", kc.name, cos_v);
+            if (cos_v < 0.9999999) {
+                fprintf(stderr, "FAIL TFQ4 Metal (%s) fp64 parity cos=%.8f (< 0.9999999)\n", kc.name, cos_v);
                 return 1;
             }
             // Issue #11: Verify fp16 saturation prevents Inf/NaN when rotated activation exceeds 65504
@@ -293,8 +339,8 @@ int main(int argc, char** argv) {
                     }
                 }
             }
-            printf("PASS tfq4_metal_test (%s: 2.0b %s fp64 parity cos=%.8f + bit-exact r1==r16==r17 + fp16 sat)\n",
-                   [[dev name] UTF8String], kc.name, cos_v);
+            printf("PASS tfq4_metal_test (%s: %s %s fp64 parity cos=%.8f + bit-exact r1==r16==r17 + fp16 sat)\n",
+                   [[dev name] UTF8String], kc.rate_lbl, kc.name, cos_v);
         }
 
         if (do_bench) {
@@ -305,7 +351,7 @@ int main(int argc, char** argv) {
             id<MTLBuffer> by = [dev newBufferWithLength:16ULL * 34816ULL * 4 options:MTLResourceStorageModePrivate];
             for (auto& kc : kinds) {
                 for (auto& s : shapes) {
-                    size_t nw = (size_t)s.N * (s.K / 16u);
+                    size_t nw = (size_t)s.N * (s.K / 128u) * kc.wpb;
                     size_t ns = (size_t)(s.N / 128u) * (s.K / 128u);
                     id<MTLBuffer> bw = [dev newBufferWithLength:nw * 4 options:MTLResourceStorageModeShared];
                     id<MTLBuffer> bsc = [dev newBufferWithLength:ns * 2 options:MTLResourceStorageModeShared];
@@ -332,8 +378,8 @@ int main(int argc, char** argv) {
                         auto t0 = std::chrono::steady_clock::now();
                         run_n(20);
                         double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / 20.0;
-                        printf("  Metal TFQ4 %-15s %-10s [%5u x %5u] 2.0b rows=%2u | %5.1f MiB | %6.3f ms | %6.1f GB/s\n",
-                               kc.name, s.name, s.N, s.K, rows, bytes / (1024.0 * 1024.0), ms, (bytes / 1e9) / (ms / 1e3));
+                        printf("  Metal TFQ4 %-20s %-10s [%5u x %5u] %s rows=%2u | %5.1f MiB | %6.3f ms | %6.1f GB/s\n",
+                               kc.name, s.name, s.N, s.K, kc.rate_lbl, rows, bytes / (1024.0 * 1024.0), ms, (bytes / 1e9) / (ms / 1e3));
                     }
                 }
             }

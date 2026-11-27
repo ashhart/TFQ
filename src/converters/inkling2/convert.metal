@@ -1,8 +1,9 @@
 // ============================================================================
-// Inkling-2 (NVFP4 + MXFP8 3D-packed MoE + BF16 non-MoE) Metal TFQ3 Converter
+// Inkling-2 (NVFP4 + MXFP8 3D-packed MoE + BF16 non-MoE) Metal TFQ3/TFQ4 Converter
 // Compiled with -fno-fast-math for 100% bit-identical output with CUDA.
 // ============================================================================
 #include "../metal_encode_common.metal"
+#include "../tfq4/tfq4_encode_common.metal"
 
 struct Ink2Params {
     uint  R;        // output rows for this projection (inter for gate/up, hidden for down)

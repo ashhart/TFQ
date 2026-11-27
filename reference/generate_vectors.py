@@ -18,6 +18,7 @@ import base64
 import hashlib
 import json
 import os
+import struct
 import sys
 import zlib
 import numpy as np
@@ -172,6 +173,127 @@ def decode_tfq4_array(words: np.ndarray, scales: np.ndarray, lut: np.ndarray, r_
     return out.astype(np.float32, copy=False)
 
 
+def decode_tfq4_1024_array(
+    words: np.ndarray, scales: np.ndarray, lut: np.ndarray, r_off: int = 0, c_off: int = 0
+) -> np.ndarray:
+    R, wpr = words.shape
+    C = (wpr // 9) * 128
+    W_rot = tfq4_ref.decode_true_e8p_1024_words(words, lut)
+    sc_tile = np.repeat(np.repeat(scales.astype(np.float32), 128, axis=0), 128, axis=1)
+    scaled = W_rot * sc_tile
+    sr = tfq3_ref.pw_sgn(tfq3_ref.SEED_ROW, np.arange(r_off, r_off + R, dtype=np.uint32))
+    sc_v = tfq3_ref.pw_sgn(tfq3_ref.SEED_COL, np.arange(c_off, c_off + C, dtype=np.uint32))
+    tmp = tfq3_ref.fwht_128(scaled.reshape(R // 128, 128, C).transpose(0, 2, 1)).transpose(0, 2, 1).reshape(R, C)
+    tmp = tmp * sr[:, None]
+    out = tfq3_ref.fwht_128(tmp.reshape(R, C // 128, 128)).reshape(R, C) * sc_v[None, :]
+    return out.astype(np.float32, copy=False)
+
+
+def generate_tfq4_1024_section() -> dict:
+    abs_cb, m_par = tfq4_ref.build_true_e8p_1024_abs_codebook()
+    tbl_buf = bytearray(32768)
+    struct.pack_into(
+        "<IIIII", tbl_buf, 0, tfq4_ref.MAGIC_PWV4, tfq4_ref.TFQ4_VER, 1024, 8, tfq4_ref.PWV4_TABLE_TRUE_E8P_1024
+    )
+    lut_f16 = np.ascontiguousarray(abs_cb, dtype="<f2")
+    tbl_buf[64 : 64 + lut_f16.nbytes] = lut_f16.tobytes()
+    tbl_sha = sha256_bytes(bytes(tbl_buf))
+
+    rng = np.random.default_rng(20260404)
+    # 8 micro-vectors covering all 4 hi2 quadrants (0..255, 256..511, 512..767, 768..1023), both cosets & parities
+    micro_cases = [
+        (0, 0x00, 0),
+        (255, 0x7F, 1),
+        (256, 0x2A, 0),
+        (511, 0x55, 1),
+        (512, 0x01, 0),
+        (767, 0x7E, 1),
+        (1023, 0x3C, 0),
+        (888, 0x63, 1),
+    ]
+    micro = []
+    for abs_idx, s7, coset in micro_cases:
+        low16 = (abs_idx & 0xFF) | ((s7 & 0x7F) << 8) | ((coset & 1) << 15)
+        hi2 = (abs_idx >> 8) & 3
+        s_bit7 = (bin(s7).count("1") ^ int(m_par[abs_idx])) & 1
+        sm8 = s7 | (s_bit7 << 7)
+        c_sgn = -1.0 if coset else 1.0
+        vals = [float(c_sgn * (float(abs_cb[abs_idx, d]) * (-1.0 if ((sm8 >> d) & 1) else 1.0) - 0.25)) for d in range(8)]
+        arr = np.array(vals, dtype="<f4")
+        vec = tfq4_ref.decode_true_e8p_1024_codes(
+            np.array([abs_idx], dtype=np.uint32),
+            np.array([s7], dtype=np.uint32),
+            np.array([coset], dtype=np.uint32),
+            abs_cb,
+        )[0]
+        assert np.array_equal(arr, vec)
+        assert float(np.max(np.abs(vec - tfq4_ref.nearest_e8_quarter(vec[None, :])[0]))) == 0.0
+        micro.append({
+            "abs_idx": abs_idx,
+            "s7": s7,
+            "coset": coset,
+            "low16": low16,
+            "hi2": hi2,
+            "values_f32": vals,
+            "values_u32_hex": [f"0x{int(u):08x}" for u in arr.view(np.uint32)],
+        })
+
+    w_blk = rng.integers(0, 1 << 32, size=(128, 9), dtype=np.uint32)
+    sc_blk = np.array([[0.0375]], dtype=np.float16)
+    W_blk = decode_tfq4_1024_array(w_blk, sc_blk, abs_cb)
+    X_blk = (rng.standard_normal((4, 128)).astype(np.float32) * 0.25).astype(np.float16)
+    Y_blk = (X_blk.astype(np.float64) @ W_blk.astype(np.float64).T).astype(np.float32)
+
+    R_m, C_m, r_off, c_off = 256, 384, 128, 128
+    w_multi = rng.integers(0, 1 << 32, size=(R_m, (C_m // 128) * 9), dtype=np.uint32)
+    sc_multi = np.array([[0.029, 0.041, 0.033], [0.048, 0.036, 0.051]], dtype=np.float16)
+    W_full = decode_tfq4_1024_array(w_multi, sc_multi, abs_cb)
+    W_slice = decode_tfq4_1024_array(
+        w_multi[r_off:, (c_off // 128) * 9 :],
+        sc_multi[r_off // 128 :, c_off // 128 :],
+        abs_cb,
+        r_off=r_off,
+        c_off=c_off,
+    )
+    assert np.array_equal(W_full[r_off:, c_off:], W_slice)
+
+    X_multi = (rng.standard_normal((4, C_m)).astype(np.float32) * 0.25).astype(np.float16)
+    Y_full = (X_multi.astype(np.float64) @ W_full.astype(np.float64).T).astype(np.float32)
+    Y_slice = (X_multi[:, c_off:].astype(np.float64) @ W_slice.astype(np.float64).T).astype(np.float32)
+
+    return {
+        "format": "TFQ4-TRUE-E8P-1024",
+        "version": 4,
+        "table_kind": tfq4_ref.PWV4_TABLE_TRUE_E8P_1024,
+        "k_codes": 1024,
+        "b_bits": tfq4_ref.TFQ4_BITS_225,
+        "tables_sha256": tbl_sha,
+        "micro": micro,
+        "block_128x128": {
+            "R": 128,
+            "C": 128,
+            "words_u32_z85_b64": b64z(w_blk.astype("<u4")),
+            "scales_f16_u16": [int(x) for x in sc_blk.view(np.uint16).reshape(-1)],
+            "decoded_f32_sha256": sha256_f32(W_blk),
+            "probe_X_f16_b64": b64z(X_blk.astype("<f2")),
+            "probe_Y_f32_b64": b64z(Y_blk.astype("<f4")),
+        },
+        "tensor_256x384_offset": {
+            "R": R_m,
+            "C": C_m,
+            "r_off": r_off,
+            "c_off": c_off,
+            "words_u32_z85_b64": b64z(w_multi.astype("<u4")),
+            "scales_f16_u16": [int(x) for x in sc_multi.view(np.uint16).reshape(-1)],
+            "full_decoded_f32_sha256": sha256_f32(W_full),
+            "slice_decoded_f32_sha256": sha256_f32(W_slice),
+            "probe_X_f16_b64": b64z(X_multi.astype("<f2")),
+            "probe_Y_full_f32_b64": b64z(Y_full.astype("<f4")),
+            "probe_Y_slice_f32_b64": b64z(Y_slice.astype("<f4")),
+        },
+    }
+
+
 def generate_tfq4_vectors(tables_path: str) -> dict:
     tbl_raw = open(tables_path, "rb").read()
     lut = tfq4_ref.load_pwv4_tables(tables_path)
@@ -241,6 +363,7 @@ def generate_tfq4_vectors(tables_path: str) -> dict:
             "probe_Y_full_f32_b64": b64z(Y_full.astype("<f4")),
             "probe_Y_slice_f32_b64": b64z(Y_slice.astype("<f4")),
         },
+        "true_e8p_1024": generate_tfq4_1024_section(),
     }
 
 

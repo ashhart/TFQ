@@ -4,7 +4,18 @@
 //   - Byte-for-byte identical to src/converters/inkling2/convert.mm (Metal).
 // ============================================================================
 #include "../cuda_encode_common.cuh"
+#include "../tfq4/tfq4_format.hpp"
+#include "../tfq4/tfq4_encode_common.cuh"
 #include "ink2_common.hpp"
+
+static inline int snr_bucket(uint32_t b) {
+    if (b == 2u)   return 0;
+    if (b == 225u) return 1;
+    if (b == 3u)   return 2;
+    if (b == 4u)   return 3;
+    if (b == 5u)   return 4;
+    return 3;
+}
 
 __device__ __forceinline__ float ink2_e2m1_cu(uint32_t nib) {
     static constexpr float LUT[16] = {
@@ -109,12 +120,13 @@ int main(int argc, char** argv) {
     }
     if (model_dir.empty() || out_dir.empty()) {
         fprintf(stderr,
-            "Usage: %s --model <dir> --out <dir> [--mode uniform4|heat543|heat443|heat43|uniform3|nonmoe]\n"
+            "Usage: %s --model <dir> --out <dir> [--mode uniform4|heat543|heat443|heat43|uniform3|heat432|heat42|heat43225|uniform2|uniform225|nonmoe]\n"
             "          [--layers S E] [--trace <file>] [--bits 4|5] [--copy-residuals] [--skip-existing] [--tables <path>]\n", argv[0]);
         return 1;
     }
     if (mode != "uniform4" && mode != "heat543" && mode != "heat443" && mode != "heat43" &&
-        mode != "uniform3" && mode != "nonmoe") {
+        mode != "uniform3" && mode != "heat432" && mode != "heat42" && mode != "heat43225" &&
+        mode != "uniform2" && mode != "uniform225" && mode != "nonmoe") {
         fprintf(stderr, "Error: unknown --mode %s\n", mode.c_str());
         return 1;
     }
@@ -123,6 +135,9 @@ int main(int argc, char** argv) {
         return 1;
     }
     mkdir(out_dir.c_str(), 0755);
+    const bool mode_uses_2b   = (mode == "heat432" || mode == "heat42" || mode == "uniform2");
+    const bool mode_uses_225b = (mode == "heat43225" || mode == "uniform225");
+    const bool mode_uses_tfq4 = mode_uses_2b || mode_uses_225b;
     const bool explicit_tables = !tables_path.empty();
     std::string dst_tables = out_dir + "/pw_v3_tables.bin";
     if (!explicit_tables) tables_path = dst_tables;
@@ -130,6 +145,9 @@ int main(int argc, char** argv) {
     PwV3TablesFile tbl;
     load_or_generate_tables(tables_path, tbl, explicit_tables);
     if (tables_path != dst_tables) ink2::copy_small_file(tables_path, dst_tables);
+    if (mode_uses_tfq4) {
+        tfq4::write_hybrid_pwv4_tables(out_dir + "/pw_v4_e8p_tables.bin", mode_uses_225b);
+    }
 
     auto grid3 = build_grid(tbl.lut3_u32,  256,   64, 2, 16,  8);
     auto grid4 = build_grid(tbl.lut4_u32, 1024,  256, 2, 16, 10);
@@ -150,6 +168,19 @@ int main(int argc, char** argv) {
     up_tbl(3, tbl.lut3_u32, 256, tbl.c64_3, grid3);
     up_tbl(4, tbl.lut4_u32, 1024, tbl.c64_4, grid4);
     up_tbl(5, tbl.lut5_u32, 1024, tbl.c64_5, grid5);
+
+    __half* d_e8p_lut = nullptr;
+    if (mode_uses_225b) {
+        tfq4::PwV4E8Tables1024 t4{};
+        tfq4::build_true_e8p_1024_tables(t4);
+        TFQ_CUDA_CHECK(cudaMalloc(&d_e8p_lut, sizeof(t4.e8p_lut)));
+        TFQ_CUDA_CHECK(cudaMemcpy(d_e8p_lut, t4.e8p_lut, sizeof(t4.e8p_lut), cudaMemcpyHostToDevice));
+    } else if (mode_uses_2b) {
+        tfq4::PwV4E8Tables t4{};
+        tfq4::build_true_e8p_tables(t4);
+        TFQ_CUDA_CHECK(cudaMalloc(&d_e8p_lut, sizeof(t4.e8p_lut)));
+        TFQ_CUDA_CHECK(cudaMemcpy(d_e8p_lut, t4.e8p_lut, sizeof(t4.e8p_lut), cudaMemcpyHostToDevice));
+    }
 
     ink2::ShardCache cache;
     cache.init(model_dir);
@@ -313,6 +344,13 @@ int main(int argc, char** argv) {
     TFQ_CUDA_CHECK(cudaMalloc(&d_pack,   (size_t)(I / 16) * (size_t)(H / 128) * 10ULL * 32ULL * 4ULL));
     TFQ_CUDA_CHECK(cudaMalloc(&d_sc,     (size_t)N_SC * 2ULL));
     TFQ_CUDA_CHECK(cudaMalloc(&d_se,     (size_t)(std::max(H, I) / 16) * 2ULL * 4ULL));
+    const uint32_t MAX_TFQ4_TG = (uint32_t)((MAX_ELEMS / 16ULL + 255ULL) / 256ULL);
+    float* d_tfq4_met = nullptr;
+    std::vector<float> h_tfq4_met;
+    if (mode_uses_tfq4) {
+        TFQ_CUDA_CHECK(cudaMalloc(&d_tfq4_met, (size_t)MAX_TFQ4_TG * 2ULL * 4ULL));
+        h_tfq4_met.resize((size_t)MAX_TFQ4_TG * 2ULL);
+    }
 
     auto heat_ranks = trace_path.empty() ? std::map<int, std::vector<int>>{} : ink2::load_heat_ranks(trace_path, N_EXP);
 
@@ -352,20 +390,28 @@ int main(int argc, char** argv) {
 
         std::vector<PrismExpertMeta> metas(N_EXP);
         memset(metas.data(), 0, metas.size() * sizeof(PrismExpertMeta));
-        const int thr5  = N_EXP / 4;
-        const int thr4  = (N_EXP * 5) / 9;
-        const int thr43 = N_EXP / 3;
+        const int thr5    = N_EXP / 4;
+        const int thr4    = (N_EXP * 5) / 9;
+        const int thr43   = N_EXP / 3;
+        const int thr4_15 = (N_EXP * 15 + 50) / 100;
+        const int thr3_40 = (N_EXP * 40 + 50) / 100;
+        const int thr4_20 = (N_EXP * 20 + 50) / 100;
         uint64_t cur_word = 0; uint32_t cur_sc = 0;
         for (int e = 0; e < N_EXP; ++e) {
             int r = ranks[e];
             uint32_t b = 4u;
-            if (mode == "heat543")       b = (r < thr5) ? 5u : (r < (N_EXP * 5) / 8 ? 4u : 3u);
-            else if (mode == "heat443")  b = (r < thr4) ? 4u : 3u;
-            else if (mode == "heat43")   b = (r < thr43) ? 4u : 3u;
-            else if (mode == "uniform4") b = 4u;
-            else if (mode == "uniform3") b = 3u;
+            if (mode == "heat543")         b = (r < thr5) ? 5u : (r < (N_EXP * 5) / 8 ? 4u : 3u);
+            else if (mode == "heat443")    b = (r < thr4) ? 4u : 3u;
+            else if (mode == "heat43")     b = (r < thr43) ? 4u : 3u;
+            else if (mode == "uniform4")   b = 4u;
+            else if (mode == "uniform3")   b = 3u;
+            else if (mode == "heat432")    b = (r < thr4_15) ? 4u : ((r < thr3_40) ? 3u : 2u);
+            else if (mode == "heat42")     b = (r < thr4_20) ? 4u : 2u;
+            else if (mode == "heat43225")  b = (r < thr4_15) ? 4u : ((r < thr3_40) ? 3u : 225u);
+            else if (mode == "uniform2")   b = 2u;
+            else if (mode == "uniform225") b = 225u;
             metas[e].b_bits = b; metas[e].heat_rank = (uint32_t)r;
-            uint64_t wpm = (uint64_t)(I / 16) * (H / 128) * (b * 2u) * 32u;
+            uint64_t wpm = tfq4::tfpw_proj_words((uint32_t)I, (uint32_t)H, b);
             metas[e].gate_word_off = cur_word; cur_word += wpm;
             metas[e].up_word_off   = cur_word; cur_word += wpm;
             metas[e].down_word_off = cur_word; cur_word += wpm;
@@ -375,7 +421,7 @@ int main(int argc, char** argv) {
         }
         std::vector<uint16_t> all_scales(cur_sc);
         std::vector<uint32_t> all_weights(cur_word);
-        double snr_sum[6] = {}; int snr_cnt[6] = {};
+        double snr_sum[5] = {}; int snr_cnt[5] = {};
 
         const size_t w13_code_stride = is_nvfp4 ? (size_t)(2 * I) * (H / 2)  : (size_t)(2 * I) * H;
         const size_t w13_sc_stride   = is_nvfp4 ? (size_t)(2 * I) * (H / 16) : (size_t)(2 * I) * (H / 32);
@@ -386,22 +432,40 @@ int main(int argc, char** argv) {
                                float outer, uint64_t w_off, uint32_t s_off, float& out_snr) {
             ink2::Ink2Params ip{R, C, row0, row_step, outer, 0u};
             MatParams mp{R, C, b, 1.0f, 0u, 0u};
+            const bool is_tfq4 = (b == tfq4::TFQ4_BITS_200 || b == tfq4::TFQ4_BITS_225);
             if (is_nvfp4) nvfp4_dequant_row_fwht_kernel<<<dim3(C / 128u, R, 1), 32>>>(d_codes, d_scales, d_fp8_lut, d_tmp, ip);
             else          mxfp8_dequant_row_fwht_kernel<<<dim3(C / 128u, R, 1), 32>>>(d_codes, d_scales, d_fp8_lut, d_tmp, ip);
             col_fwht_and_ss_kernel<<<dim3(C, R / 128u, 1), 32>>>(d_tmp, d_rot, d_ss, mp);
-            finalize_scales_and_pack_nax_kernel<<<dim3(R / 16u, C / 128u, 1), 32>>>(d_rot, d_ss, d_sc, d_str, mp);
-            uint32_t n_str = (R / 16u) * 32u;
-            for (uint32_t off = 0; off < n_str; off += CHUNK_STR) {
-                uint32_t cnt = std::min(CHUNK_STR, n_str - off);
-                launch_prism_encode(b, cnt, d_str, d_lut[b], d_c64[b], d_grid[b], d_hist, d_pack, EncParams{R, C, b, off, cnt});
-            }
-            prism_verify_v3_snr_kernel<<<R / 16u, 32>>>(d_pack, d_sc, d_lut[b], d_c64[b], d_rot, d_se, mp);
-            TFQ_CUDA_CHECK(cudaDeviceSynchronize());
             double sig = 0.0, err_s = 0.0;
-            cuda_read_se_det(d_se, R / 16u, sig, err_s);
+            if (is_tfq4) {
+                float sm = (b == tfq4::TFQ4_BITS_225) ? tfq4::TRUE_E8P1024_BASE_SCALE : tfq4::TRUE_E8P_BASE_SCALE;
+                uint32_t tfq4_ntg = (uint32_t)((((uint64_t)R * (C / 16u)) + 255ull) / 256ull);
+                tfq4_enc::tfq4_finalize_scales_k<<<N_SC, 32>>>(d_ss, d_sc, N_SC, sm);
+                if (b == tfq4::TFQ4_BITS_225) {
+                    tfq4_enc::tfq4_true_e8p_1024_encode_k<<<tfq4_ntg, 256>>>(
+                        d_rot, d_sc, reinterpret_cast<const uint4*>(d_e8p_lut), d_pack, d_tfq4_met, R, C);
+                } else {
+                    tfq4_enc::tfq4_true_e8p_encode_k<<<tfq4_ntg, 256>>>(
+                        d_rot, d_sc, d_e8p_lut, d_pack, d_tfq4_met, R, C);
+                }
+                TFQ_CUDA_CHECK(cudaDeviceSynchronize());
+                TFQ_CUDA_CHECK(cudaMemcpy(h_tfq4_met.data(), d_tfq4_met, (size_t)tfq4_ntg * 2ULL * 4ULL, cudaMemcpyDeviceToHost));
+                for (uint32_t s = 0; s < tfq4_ntg; ++s) { sig += (double)h_tfq4_met[2u * s]; err_s += (double)h_tfq4_met[2u * s + 1u]; }
+            } else {
+                finalize_scales_and_pack_nax_kernel<<<dim3(R / 16u, C / 128u, 1), 32>>>(d_rot, d_ss, d_sc, d_str, mp);
+                uint32_t n_str = (R / 16u) * 32u;
+                for (uint32_t off = 0; off < n_str; off += CHUNK_STR) {
+                    uint32_t cnt = std::min(CHUNK_STR, n_str - off);
+                    launch_prism_encode(b, cnt, d_str, d_lut[b], d_c64[b], d_grid[b], d_hist, d_pack, EncParams{R, C, b, off, cnt});
+                }
+                prism_verify_v3_snr_kernel<<<R / 16u, 32>>>(d_pack, d_sc, d_lut[b], d_c64[b], d_rot, d_se, mp);
+                TFQ_CUDA_CHECK(cudaDeviceSynchronize());
+                cuda_read_se_det(d_se, R / 16u, sig, err_s);
+            }
             out_snr = (float)(10.0 * std::log10(sig / std::max(err_s, 1e-18)));
-            snr_sum[b] += out_snr; snr_cnt[b]++;
-            uint64_t wpm = (uint64_t)(R / 16u) * (C / 128u) * (b * 2u) * 32u;
+            int sb = snr_bucket(b);
+            snr_sum[sb] += out_snr; snr_cnt[sb]++;
+            uint64_t wpm = tfq4::tfpw_proj_words(R, C, b);
             TFQ_CUDA_CHECK(cudaMemcpy(all_scales.data() + s_off, d_sc, (size_t)N_SC * 2ULL, cudaMemcpyDeviceToHost));
             TFQ_CUDA_CHECK(cudaMemcpy(all_weights.data() + w_off, d_pack, wpm * 4ULL, cudaMemcpyDeviceToHost));
         };
@@ -472,13 +536,15 @@ int main(int argc, char** argv) {
         cache.evict_all();
 
         double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_lyr).count();
-        printf("  [L%02d/%02d %s] %.3f GiB | 3b=%.2f(%d) 4b=%.2f(%d) 5b=%.2f(%d) dB | %.1fs\n",
-               lyr, l_end, is_nvfp4 ? "NVFP4" : "MXFP8",
-               (double)(endp + pade) / (double)(1ULL << 30),
-               snr_cnt[3] ? snr_sum[3] / snr_cnt[3] : 0.0, snr_cnt[3] / 3,
-               snr_cnt[4] ? snr_sum[4] / snr_cnt[4] : 0.0, snr_cnt[4] / 3,
-               snr_cnt[5] ? snr_sum[5] / snr_cnt[5] : 0.0, snr_cnt[5] / 3,
-               dt);
+        printf("  [L%02d/%02d %s] %.3f GiB |", lyr, l_end, is_nvfp4 ? "NVFP4" : "MXFP8",
+               (double)(endp + pade) / (double)(1ULL << 30));
+        const char* lbl[5] = {"2b", "2.25b", "3b", "4b", "5b"};
+        for (int sb = 0; sb < 5; ++sb) {
+            if (snr_cnt[sb] || sb >= 2) {
+                printf(" %s=%.2f(%d)", lbl[sb], snr_cnt[sb] ? snr_sum[sb] / snr_cnt[sb] : 0.0, snr_cnt[sb] / 3);
+            }
+        }
+        printf(" dB | %.1fs\n", dt);
         fflush(stdout);
     }
 

@@ -15,23 +15,23 @@ Usage:
   tfq3 --version | --help
 
 Options:
-  -o, --out DIR              Output directory (default: <model>-TFQ3, or <model>-TFQ4 for --bits 2)
+  -o, --out DIR              Output directory (default: <model>-TFQ3, or <model>-TFQ4 for --bits 2|2.25)
   --family NAME              auto | generic | qwen27 | flashnext | glm | inkling2 | ernie (default: auto)
   --profile PROFILE          Bit profile: 4b | 3.5b | 3b | 5b (default: 4b; ERNIE: 3b | 4b | 5b)
-  --bits N                   Uniform bit width for generic converter: 2 (TFQ4-E8P) | 3 | 4 | 5
+  --bits N                   Uniform bit width for generic converter: 2 (TFQ4-E8P) | 2.25 (TFQ4-E8P-1024) | 3 | 4 | 5
   --target-gib GB            Fit total checkpoint into GB via data-free sensitivity allocation
   --fit auto|GB              Auto-size to local GPU memory budget (or explicit GB)
   --residual MODE            Qwen3.8-27B residual precision: auto | bf16 | q8 (default: auto)
-  --head-bits N              lm_head bits: TFQ3 0 | 4 | 5 (default: 4); TFQ4 0 | 2 (default: 0 keeps lm_head in residual)
+  --head-bits N              lm_head bits: TFQ3 0 | 4 | 5 (default: 4); TFQ4 0 | 2 | 2.25 (default: 0 keeps lm_head in residual)
   --ple-bits N               Qwen3.8-Flash-Next PLE bits: 3 | 4 (default: 3)
   --quantize-vision          Also quantize vision tower linears (generic converter)
   --quantize-drafter         Quantize standalone DFlash2 / DSpine drafter checkpoint
   --quantize-embed           Also quantize embed_tokens table (generic converter)
-  --table-kind KIND          TFQ4 (--bits 2) codebook: trained (default, kind=0) | e8p (true QuIP# E8+1/4, kind=2)
+  --table-kind KIND          TFQ4 codebook: trained (kind=0) | e8p (kind=2, 2.0b) | e8p1024 (kind=3, 2.25b)
   --max-shard-gib GB         Max TFQ4 shard size in GiB (default: 3.4)
   --trace FILE               Optional trace-guided HeatAlloc routing counts (uses calibration counts)
-  --glm-mode MODE            GLM deep-layer MoE bit mode: heat43 (3.33 bpw) | uniform4 (4.00 bpw)
-  --inkling2-mode MODE       Inkling-2 MoE bit mode: uniform3 | heat43 | heat443 | heat543 | uniform4
+  --glm-mode MODE            GLM MoE bit mode: heat43 | heat443 | uniform4 | uniform3 | heat432 | heat42 | heat43225 | uniform2 | uniform225
+  --inkling2-mode MODE       Inkling-2 MoE bit mode: uniform3 | heat43 | heat443 | heat543 | uniform4 | heat432 | heat42 | heat43225 | uniform2 | uniform225
   --keep-nonmoe-bf16         GLM: skip nonmoe.tffpw quantization so attention/shared/head stay full-precision
   --nonmoe-model DIR         Optional 8-bit source for GLM nonmoe.tffpw
   --skip-existing            Resume MoE conversion, skipping finished shards
@@ -332,20 +332,20 @@ run_convert() {
             -o|--out) [ $# -ge 2 ] || die "--out requires a directory"; out_dir="$2"; shift 2 ;;
             --family) [ $# -ge 2 ] || die "--family requires a value"; family="$2"; shift 2 ;;
             --profile) [ $# -ge 2 ] || die "--profile requires 4b|3.5b|3b|5b"; profile="$2"; shift 2 ;;
-            --bits) [ $# -ge 2 ] || die "--bits requires 2|3|4|5"; bits_override="$2"; shift 2 ;;
+            --bits) [ $# -ge 2 ] || die "--bits requires 2|2.25|3|4|5"; bits_override="$2"; shift 2 ;;
             --target-gib) [ $# -ge 2 ] || die "--target-gib requires GB"; target_gib="$2"; shift 2 ;;
             --fit) [ $# -ge 2 ] || die "--fit requires auto or GB"; fit_mode="$2"; shift 2 ;;
             --residual) [ $# -ge 2 ] || die "--residual requires auto|bf16|q8"; residual="$2"; shift 2 ;;
-            --head-bits) [ $# -ge 2 ] || die "--head-bits requires 0|2|4|5"; head_bits="$2"; head_bits_set=1; shift 2 ;;
+            --head-bits) [ $# -ge 2 ] || die "--head-bits requires 0|2|2.25|4|5"; head_bits="$2"; head_bits_set=1; shift 2 ;;
             --ple-bits) [ $# -ge 2 ] || die "--ple-bits requires 3|4"; ple_bits="$2"; shift 2 ;;
             --quantize-vision) quantize_vision=1; shift ;;
             --quantize-drafter) quantize_drafter=1; shift ;;
             --quantize-embed) quantize_embed=1; shift ;;
-            --table-kind) [ $# -ge 2 ] || die "--table-kind requires trained|e8p"; table_kind="$2"; shift 2 ;;
+            --table-kind) [ $# -ge 2 ] || die "--table-kind requires trained|e8p|e8p1024"; table_kind="$2"; shift 2 ;;
             --max-shard-gib) [ $# -ge 2 ] || die "--max-shard-gib requires GB"; max_shard_gib="$2"; shift 2 ;;
             --trace) [ $# -ge 2 ] || die "--trace requires a file path"; trace_file="$2"; shift 2 ;;
-            --glm-mode) [ $# -ge 2 ] || die "--glm-mode requires heat43|uniform4"; glm_mode="$2"; shift 2 ;;
-            --inkling2-mode) [ $# -ge 2 ] || die "--inkling2-mode requires uniform3|heat43|heat443|heat543|uniform4"; inkling2_mode="$2"; shift 2 ;;
+            --glm-mode) [ $# -ge 2 ] || die "--glm-mode requires heat43|heat443|uniform4|uniform3|heat432|heat42|heat43225|uniform2|uniform225"; glm_mode="$2"; shift 2 ;;
+            --inkling2-mode) [ $# -ge 2 ] || die "--inkling2-mode requires uniform3|heat43|heat443|heat543|uniform4|heat432|heat42|heat43225|uniform2|uniform225"; inkling2_mode="$2"; shift 2 ;;
             --keep-nonmoe-bf16) keep_nonmoe_bf16=1; shift ;;
             --nonmoe-model) [ $# -ge 2 ] || die "--nonmoe-model requires a directory"; nonmoe_model="$2"; shift 2 ;;
             --skip-existing) skip_existing=1; shift ;;
@@ -364,7 +364,11 @@ run_convert() {
     done
 
     [ -n "$model_arg" ] || { usage >&2; exit 2; }
-    case "$bits_override" in ""|2|3|4|5) ;; *) die "invalid --bits '${bits_override}' (expected 2, 3, 4, or 5)" ;; esac
+    case "$bits_override" in ""|2|2.25|225|3|4|5) ;; *) die "invalid --bits '${bits_override}' (expected 2, 2.25, 3, 4, or 5)" ;; esac
+
+    local is_tfq4=0
+    case "$bits_override" in 2|2.25|225) is_tfq4=1 ;; esac
+    case "$table_kind" in e8p1024|e8p-1024|true-e8p-1024|3) is_tfq4=1 ;; esac
 
     local expanded_model="${model_arg/#\~/$HOME}"
     local src_dir=""
@@ -392,7 +396,7 @@ run_convert() {
     fi
 
     local fmt_tag="TFQ3"
-    [ "$bits_override" = "2" ] && fmt_tag="TFQ4"
+    [ "$is_tfq4" -eq 1 ] && fmt_tag="TFQ4"
     if [ -z "$out_dir" ]; then
         out_dir="$(default_out_dir "$model_arg" "$from_repo" "$fmt_tag")"
     else
@@ -405,7 +409,7 @@ run_convert() {
     fi
 
     if [ "$family" = "auto" ]; then
-        if [ -n "$target_gib" ] || [ -n "$fit_mode" ] || [ -n "$bits_override" ] || [ "$quantize_vision" -eq 1 ] || [ "$quantize_drafter" -eq 1 ] || [ "$quantize_embed" -eq 1 ]; then
+        if [ -n "$target_gib" ] || [ -n "$fit_mode" ] || [ -n "$bits_override" ] || [ "$is_tfq4" -eq 1 ] || [ "$quantize_vision" -eq 1 ] || [ "$quantize_drafter" -eq 1 ] || [ "$quantize_embed" -eq 1 ]; then
             family="generic"
         elif [ "$detected_family" != "unknown" ]; then
             family="$detected_family"
@@ -427,27 +431,31 @@ run_convert() {
 
     case "$family" in
         generic)
-            if [ "${bits_override}" = "2" ]; then
+            if [ "$is_tfq4" -eq 1 ]; then
                 local tfq4_head_bits="0"
                 if [ "$head_bits_set" -eq 1 ]; then
                     case "$head_bits" in
-                        0|2) tfq4_head_bits="$head_bits" ;;
-                        *) die "invalid --head-bits '${head_bits}' for TFQ4 (--bits 2): expected 0 (keep lm_head in residual, default) or 2" ;;
+                        0|2|2.25|225) tfq4_head_bits="$head_bits" ;;
+                        *) die "invalid --head-bits '${head_bits}' for TFQ4: expected 0 (keep lm_head in residual, default), 2, or 2.25" ;;
                     esac
                 fi
                 local conv_bin
                 conv_bin="$(require_tool "$lib_dir" "tfq4-convert${suffix}")"
                 local g_flags=(--model "$src_dir" --out "$out_dir" --head-bits "$tfq4_head_bits")
+                [ -n "$bits_override" ] && g_flags+=(--bits "$bits_override")
                 [ -n "$table_kind" ] && g_flags+=(--table-kind "$table_kind")
                 [ -n "$max_shard_gib" ] && g_flags+=(--max-shard-gib "$max_shard_gib")
                 [ "$quantize_vision" -eq 1 ] && g_flags+=(--quantize-vision)
                 [ "$quantize_drafter" -eq 1 ] && g_flags+=(--quantize-drafter)
                 [ "$quantize_embed" -eq 1 ] && g_flags+=(--quantize-embed)
+                local rate_tag="2.001 bpw"
+                case "$bits_override" in 2.25|225) rate_tag="2.251 bpw" ;; esac
+                case "$table_kind" in e8p1024|e8p-1024|true-e8p-1024|3) rate_tag="2.251 bpw" ;; esac
                 echo ""
                 if [ "$DRY_RUN" -eq 1 ] && [ -d "$src_dir" ]; then
                     "$conv_bin" "${g_flags[@]}" --dry-run
                 else
-                    echo "=== [1/2] Quantizing & packaging model (100% data-free TFQ4-E8P 2.001 bpw) ==="
+                    echo "=== [1/2] Quantizing & packaging model (100% data-free TFQ4-E8P ${rate_tag}) ==="
                     run_cmd "$conv_bin" "${g_flags[@]}"
                     echo "=== [2/2] Validating TFQ4 checkpoint ==="
                     run_cmd "$inspect_bin" "$out_dir"
@@ -514,7 +522,7 @@ run_convert() {
             run_cmd "$inspect_bin" "$out_dir"
             ;;
         glm)
-            case "$glm_mode" in heat43|heat443|uniform4|uniform3) ;; *) die "invalid --glm-mode '${glm_mode}' (expected heat43, heat443, uniform4, or uniform3)" ;; esac
+            case "$glm_mode" in heat43|heat443|uniform4|uniform3|heat432|heat42|heat43225|uniform2|uniform225) ;; *) die "invalid --glm-mode '${glm_mode}' (expected heat43, heat443, uniform4, uniform3, heat432, heat42, heat43225, uniform2, or uniform225)" ;; esac
             if [ "$fmt_kind" != "fp8" ] && [ "$auto_res" != "q8" ]; then  # a BF16 checkpoint
                 [ "$keep_nonmoe_bf16" -eq 1 ] || [ -n "$nonmoe_model" ] || die "the GLM non-MoE pass reads MLX 8-bit tensors, which a BF16 checkpoint does not have: pass --keep-nonmoe-bf16, or --nonmoe-model <MLX 8-bit dir>"
             fi
@@ -524,7 +532,9 @@ run_convert() {
             [ -n "$trace_file" ] && extra_flags+=(--trace "$trace_file")
             [ "$skip_existing" -eq 1 ] && extra_flags+=(--skip-existing)
             local boundary_mode="heat543"
-            [ "$glm_mode" = "uniform4" ] && boundary_mode="uniform4"
+            case "$glm_mode" in
+                uniform4|uniform2|uniform225) boundary_mode="$glm_mode" ;;
+            esac
             local glm_l_end=44
             if [ "$model_type" = "glm_moe_dsa" ] && [ "${num_layers:-0}" -gt 45 ]; then
                 glm_l_end=$((num_layers - 1))
@@ -563,7 +573,7 @@ run_convert() {
                     *)    die "invalid --profile '${profile}' for Inkling-2 (expected 4b, 3.5b, or 3b, or pass --inkling2-mode)" ;;
                 esac
             fi
-            case "$inkling2_mode" in uniform4|heat543|heat443|heat43|uniform3) ;; *) die "invalid --inkling2-mode '${inkling2_mode}'" ;; esac
+            case "$inkling2_mode" in uniform4|heat543|heat443|heat43|uniform3|heat432|heat42|heat43225|uniform2|uniform225) ;; *) die "invalid --inkling2-mode '${inkling2_mode}'" ;; esac
             local conv_bin
             conv_bin="$(require_tool "$lib_dir" "tfq3-inkling2-convert${suffix}")"
             local extra_flags=()

@@ -13,9 +13,22 @@
 #include <mach-o/dyld.h>
 #include <chrono>
 #include "../tfq_xxh64.hpp"
+#include "../tfq4/tfq4_format.hpp"
 #include "ink2_common.hpp"
 
 using tfq_tables::PwV3TablesFile;
+
+struct Tfq4MatParams { uint32_t R, C, r_off, pad0; };
+struct Tfq4ScaleParams { uint32_t n_blocks; float scale_mult; };
+
+static inline int snr_bucket(uint32_t b) {
+    if (b == 2u)   return 0;
+    if (b == 225u) return 1;
+    if (b == 3u)   return 2;
+    if (b == 4u)   return 3;
+    if (b == 5u)   return 4;
+    return 3;
+}
 
 struct PrismLayerHeader {
     uint32_t magic, version, layer_idx, num_experts, num_tensors, hidden_size, moe_inter, reserved0;
@@ -100,13 +113,14 @@ int main(int argc, char** argv) {
     }
     if (model_dir.empty() || out_dir.empty()) {
         fprintf(stderr,
-            "Usage: %s --model <dir> --out <dir> [--mode uniform4|heat543|heat443|heat43|uniform3|nonmoe]\n"
+            "Usage: %s --model <dir> --out <dir> [--mode uniform4|heat543|heat443|heat43|uniform3|heat432|heat42|heat43225|uniform2|uniform225|nonmoe]\n"
             "          [--layers S E] [--trace <file>] [--bits 4|5] [--copy-residuals] [--skip-existing]\n"
             "          [--tables <path>] [--metallib <path>]\n", argv[0]);
         return 1;
     }
     if (mode != "uniform4" && mode != "heat543" && mode != "heat443" && mode != "heat43" &&
-        mode != "uniform3" && mode != "nonmoe") {
+        mode != "uniform3" && mode != "heat432" && mode != "heat42" && mode != "heat43225" &&
+        mode != "uniform2" && mode != "uniform225" && mode != "nonmoe") {
         fprintf(stderr, "Error: unknown --mode %s\n", mode.c_str());
         return 1;
     }
@@ -116,6 +130,9 @@ int main(int argc, char** argv) {
     }
 
     mkdir(out_dir.c_str(), 0755);
+    const bool mode_uses_2b   = (mode == "heat432" || mode == "heat42" || mode == "uniform2");
+    const bool mode_uses_225b = (mode == "heat43225" || mode == "uniform225");
+    const bool mode_uses_tfq4 = mode_uses_2b || mode_uses_225b;
     const bool explicit_tables = !tables_path.empty();
     std::string dst_tables = out_dir + "/pw_v3_tables.bin";
     if (!explicit_tables) tables_path = dst_tables;
@@ -123,6 +140,9 @@ int main(int argc, char** argv) {
     PwV3TablesFile tbl;
     tfq_tables::load_or_write_pwv3_tables(tables_path, tbl, explicit_tables);
     if (tables_path != dst_tables) ink2::copy_small_file(tables_path, dst_tables);
+    if (mode_uses_tfq4) {
+        tfq4::write_hybrid_pwv4_tables(out_dir + "/pw_v4_e8p_tables.bin", mode_uses_225b);
+    }
 
     auto grid3 = tfq_tables::build_grid(tbl.lut3_u32,  256,   64, 2, 16,  8);
     auto grid4 = tfq_tables::build_grid(tbl.lut4_u32, 1024,  256, 2, 16, 10);
@@ -186,10 +206,23 @@ int main(int argc, char** argv) {
         pso_enc[4] = get_pso("prism_encode_v3_b4");
         pso_enc[5] = get_pso("prism_encode_v3_b5");
         auto pso_snr = get_pso("prism_verify_v3_snr");
+        id<MTLComputePipelineState> pso_tfq4_sc  = mode_uses_tfq4 ? get_pso("tfq4_finalize_scales") : nil;
+        id<MTLComputePipelineState> pso_tfq4_2b  = mode_uses_2b   ? get_pso("tfq4_true_e8p_encode") : nil;
+        id<MTLComputePipelineState> pso_tfq4_225 = mode_uses_225b ? get_pso("tfq4_true_e8p_1024_encode") : nil;
 
         float fp8_lut[256];
         for (int i = 0; i < 256; ++i) fp8_lut[i] = ink2::e4m3_to_f32_host((uint8_t)i);
         id<MTLBuffer> buf_fp8_lut = [dev newBufferWithBytes:fp8_lut length:1024 options:MTLResourceStorageModeShared];
+        id<MTLBuffer> buf_e8p_lut = nil;
+        if (mode_uses_225b) {
+            tfq4::PwV4E8Tables1024 t4{};
+            tfq4::build_true_e8p_1024_tables(t4);
+            buf_e8p_lut = [dev newBufferWithBytes:t4.e8p_lut length:sizeof(t4.e8p_lut) options:MTLResourceStorageModeShared];
+        } else if (mode_uses_2b) {
+            tfq4::PwV4E8Tables t4{};
+            tfq4::build_true_e8p_tables(t4);
+            buf_e8p_lut = [dev newBufferWithBytes:t4.e8p_lut length:sizeof(t4.e8p_lut) options:MTLResourceStorageModeShared];
+        }
         id<MTLBuffer> buf_lut[6] = {}, buf_c64[6] = {}, buf_grid[6] = {};
         buf_lut[3]  = [dev newBufferWithBytes:tbl.lut3_u32 length:sizeof(tbl.lut3_u32) options:MTLResourceStorageModeShared];
         buf_lut[4]  = [dev newBufferWithBytes:tbl.lut4_u32 length:sizeof(tbl.lut4_u32) options:MTLResourceStorageModeShared];
@@ -380,6 +413,10 @@ int main(int argc, char** argv) {
         id<MTLBuffer> buf_mat_pack = [dev newBufferWithLength:(size_t)(I / 16) * (size_t)(H / 128) * 10ULL * 32ULL * 4ULL options:MTLResourceStorageModeShared];
         id<MTLBuffer> buf_mat_sc   = [dev newBufferWithLength:(size_t)N_SC * 2ULL options:MTLResourceStorageModeShared];
         id<MTLBuffer> buf_se_out   = [dev newBufferWithLength:(size_t)(std::max(H, I) / 16) * 2ULL * 4ULL options:MTLResourceStorageModeShared];
+        const uint32_t MAX_TFQ4_TG = (uint32_t)((MAX_ELEMS / 16ULL + 255ULL) / 256ULL);
+        id<MTLBuffer> buf_tfq4_met = mode_uses_tfq4
+            ? [dev newBufferWithLength:(size_t)MAX_TFQ4_TG * 2ULL * 4ULL options:MTLResourceStorageModeShared]
+            : nil;
 
         auto heat_ranks = trace_path.empty() ? std::map<int, std::vector<int>>{} : ink2::load_heat_ranks(trace_path, N_EXP);
 
@@ -432,21 +469,29 @@ int main(int argc, char** argv) {
 
             std::vector<PrismExpertMeta> metas(N_EXP);
             memset(metas.data(), 0, metas.size() * sizeof(PrismExpertMeta));
-            const int thr5  = N_EXP / 4;          // 96 / 384 (25%)
-            const int thr4  = (N_EXP * 5) / 9;    // 213 / 384 (~55.5%)
-            const int thr43 = N_EXP / 3;          // 128 / 384 (33.3%)
+            const int thr5    = N_EXP / 4;          // 96 / 384 (25%)
+            const int thr4    = (N_EXP * 5) / 9;    // 213 / 384 (~55.5%)
+            const int thr43   = N_EXP / 3;          // 128 / 384 (33.3%)
+            const int thr4_15 = (N_EXP * 15 + 50) / 100;
+            const int thr3_40 = (N_EXP * 40 + 50) / 100;
+            const int thr4_20 = (N_EXP * 20 + 50) / 100;
             uint64_t cur_word = 0; uint32_t cur_sc = 0;
             for (int e = 0; e < N_EXP; ++e) {
                 int r = ranks[e];
                 uint32_t b = 4u;
-                if (mode == "heat543")       b = (r < thr5) ? 5u : (r < (N_EXP * 5) / 8 ? 4u : 3u);
-                else if (mode == "heat443")  b = (r < thr4) ? 4u : 3u;
-                else if (mode == "heat43")   b = (r < thr43) ? 4u : 3u;
-                else if (mode == "uniform4") b = 4u;
-                else if (mode == "uniform3") b = 3u;
+                if (mode == "heat543")         b = (r < thr5) ? 5u : (r < (N_EXP * 5) / 8 ? 4u : 3u);
+                else if (mode == "heat443")    b = (r < thr4) ? 4u : 3u;
+                else if (mode == "heat43")     b = (r < thr43) ? 4u : 3u;
+                else if (mode == "uniform4")   b = 4u;
+                else if (mode == "uniform3")   b = 3u;
+                else if (mode == "heat432")    b = (r < thr4_15) ? 4u : ((r < thr3_40) ? 3u : 2u);
+                else if (mode == "heat42")     b = (r < thr4_20) ? 4u : 2u;
+                else if (mode == "heat43225")  b = (r < thr4_15) ? 4u : ((r < thr3_40) ? 3u : 225u);
+                else if (mode == "uniform2")   b = 2u;
+                else if (mode == "uniform225") b = 225u;
                 metas[e].b_bits = b;
                 metas[e].heat_rank = (uint32_t)r;
-                uint64_t wpm = (uint64_t)(I / 16) * (H / 128) * (b * 2u) * 32u;
+                uint64_t wpm = tfq4::tfpw_proj_words((uint32_t)I, (uint32_t)H, b);
                 metas[e].gate_word_off = cur_word; cur_word += wpm;
                 metas[e].up_word_off   = cur_word; cur_word += wpm;
                 metas[e].down_word_off = cur_word; cur_word += wpm;
@@ -456,7 +501,7 @@ int main(int argc, char** argv) {
             }
             std::vector<uint16_t> all_scales(cur_sc);
             std::vector<uint32_t> all_weights(cur_word);
-            double snr_sum[6] = {}; int snr_cnt[6] = {};
+            double snr_sum[5] = {}; int snr_cnt[5] = {};
 
             const size_t w13_code_stride = is_nvfp4 ? (size_t)(2 * I) * (H / 2)  : (size_t)(2 * I) * H;
             const size_t w13_sc_stride   = is_nvfp4 ? (size_t)(2 * I) * (H / 16) : (size_t)(2 * I) * (H / 32);
@@ -467,6 +512,8 @@ int main(int argc, char** argv) {
                                    float outer, uint64_t w_off, uint32_t s_off, float& out_snr) {
                 ink2::Ink2Params ip{R, C, row0, row_step, outer, 0u};
                 MatParams mp{R, C, b, 1.0f, 0u, 0u};
+                const bool is_tfq4 = (b == tfq4::TFQ4_BITS_200 || b == tfq4::TFQ4_BITS_225);
+                uint32_t tfq4_ntg = is_tfq4 ? (uint32_t)((((uint64_t)R * (C / 16u)) + 255ull) / 256ull) : 0u;
                 int total_streams = (int)(R / 16) * 32;
                 int batch_sz = std::max(1, (int)((size_t)BATCH_STREAMS * (size_t)MAX_C / (size_t)C));
 
@@ -489,48 +536,73 @@ int main(int argc, char** argv) {
                     [enc setBytes:&mp length:sizeof(mp) atIndex:3];
                     [enc dispatchThreadgroups:MTLSizeMake(C, R / 128, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
 
-                    [enc setComputePipelineState:pso_pack_nax];
-                    [enc setBuffer:buf_w_rot offset:0 atIndex:0];
-                    [enc setBuffer:buf_blk_ss offset:0 atIndex:1];
-                    [enc setBuffer:buf_mat_sc offset:0 atIndex:2];
-                    [enc setBuffer:buf_streams offset:0 atIndex:3];
-                    [enc setBytes:&mp length:sizeof(mp) atIndex:4];
-                    [enc dispatchThreadgroups:MTLSizeMake(R / 16, C / 128, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+                    if (is_tfq4) {
+                        Tfq4ScaleParams sp{N_SC, (b == tfq4::TFQ4_BITS_225) ? tfq4::TRUE_E8P1024_BASE_SCALE : tfq4::TRUE_E8P_BASE_SCALE};
+                        [enc setComputePipelineState:pso_tfq4_sc];
+                        [enc setBuffer:buf_blk_ss offset:0 atIndex:0];
+                        [enc setBuffer:buf_mat_sc offset:0 atIndex:1];
+                        [enc setBytes:&sp length:sizeof(sp) atIndex:2];
+                        [enc dispatchThreadgroups:MTLSizeMake(N_SC, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
 
-                    [enc setComputePipelineState:pso_enc[b]];
-                    for (int off = 0; off < total_streams; off += batch_sz) {
-                        int cnt = std::min(batch_sz, total_streams - off);
-                        EncParams ep{R, C, b, (uint32_t)off, (uint32_t)cnt};
-                        [enc setBuffer:buf_streams offset:0 atIndex:0];
-                        [enc setBuffer:buf_lut[b] offset:0 atIndex:1];
-                        [enc setBuffer:buf_c64[b] offset:0 atIndex:2];
-                        [enc setBuffer:buf_grid[b] offset:0 atIndex:3];
-                        [enc setBuffer:buf_hist offset:0 atIndex:4];
-                        [enc setBuffer:buf_mat_pack offset:0 atIndex:5];
-                        [enc setBytes:&ep length:sizeof(ep) atIndex:6];
-                        [enc dispatchThreadgroups:MTLSizeMake(cnt, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                        Tfq4MatParams tp{R, C, 0u, 0u};
+                        [enc setComputePipelineState:((b == tfq4::TFQ4_BITS_225) ? pso_tfq4_225 : pso_tfq4_2b)];
+                        [enc setBuffer:buf_w_rot offset:0 atIndex:0];
+                        [enc setBuffer:buf_mat_sc offset:0 atIndex:1];
+                        [enc setBuffer:buf_e8p_lut offset:0 atIndex:2];
+                        [enc setBuffer:buf_mat_pack offset:0 atIndex:3];
+                        [enc setBuffer:buf_tfq4_met offset:0 atIndex:4];
+                        [enc setBytes:&tp length:sizeof(tp) atIndex:5];
+                        [enc dispatchThreadgroups:MTLSizeMake(tfq4_ntg, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                    } else {
+                        [enc setComputePipelineState:pso_pack_nax];
+                        [enc setBuffer:buf_w_rot offset:0 atIndex:0];
+                        [enc setBuffer:buf_blk_ss offset:0 atIndex:1];
+                        [enc setBuffer:buf_mat_sc offset:0 atIndex:2];
+                        [enc setBuffer:buf_streams offset:0 atIndex:3];
+                        [enc setBytes:&mp length:sizeof(mp) atIndex:4];
+                        [enc dispatchThreadgroups:MTLSizeMake(R / 16, C / 128, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+
+                        [enc setComputePipelineState:pso_enc[b]];
+                        for (int off = 0; off < total_streams; off += batch_sz) {
+                            int cnt = std::min(batch_sz, total_streams - off);
+                            EncParams ep{R, C, b, (uint32_t)off, (uint32_t)cnt};
+                            [enc setBuffer:buf_streams offset:0 atIndex:0];
+                            [enc setBuffer:buf_lut[b] offset:0 atIndex:1];
+                            [enc setBuffer:buf_c64[b] offset:0 atIndex:2];
+                            [enc setBuffer:buf_grid[b] offset:0 atIndex:3];
+                            [enc setBuffer:buf_hist offset:0 atIndex:4];
+                            [enc setBuffer:buf_mat_pack offset:0 atIndex:5];
+                            [enc setBytes:&ep length:sizeof(ep) atIndex:6];
+                            [enc dispatchThreadgroups:MTLSizeMake(cnt, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                        }
+
+                        [enc setComputePipelineState:pso_snr];
+                        [enc setBuffer:buf_mat_pack offset:0 atIndex:0];
+                        [enc setBuffer:buf_mat_sc offset:0 atIndex:1];
+                        [enc setBuffer:buf_lut[b] offset:0 atIndex:2];
+                        [enc setBuffer:buf_c64[b] offset:0 atIndex:3];
+                        [enc setBuffer:buf_w_rot offset:0 atIndex:4];
+                        [enc setBuffer:buf_se_out offset:0 atIndex:5];
+                        [enc setBytes:&mp length:sizeof(mp) atIndex:6];
+                        [enc dispatchThreadgroups:MTLSizeMake(R / 16, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
                     }
-
-                    [enc setComputePipelineState:pso_snr];
-                    [enc setBuffer:buf_mat_pack offset:0 atIndex:0];
-                    [enc setBuffer:buf_mat_sc offset:0 atIndex:1];
-                    [enc setBuffer:buf_lut[b] offset:0 atIndex:2];
-                    [enc setBuffer:buf_c64[b] offset:0 atIndex:3];
-                    [enc setBuffer:buf_w_rot offset:0 atIndex:4];
-                    [enc setBuffer:buf_se_out offset:0 atIndex:5];
-                    [enc setBytes:&mp length:sizeof(mp) atIndex:6];
-                    [enc dispatchThreadgroups:MTLSizeMake(R / 16, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
                     [enc endEncoding];
                     [cb commit];
                     [cb waitUntilCompleted];
                 }
-                const float* se = (const float*)[buf_se_out contents];
                 double sig = 0.0, err_s = 0.0;
-                for (uint32_t s = 0; s < R / 16; ++s) { sig += se[2 * s]; err_s += se[2 * s + 1]; }
+                if (is_tfq4) {
+                    const float* met = (const float*)[buf_tfq4_met contents];
+                    for (uint32_t s = 0; s < tfq4_ntg; ++s) { sig += (double)met[2u * s]; err_s += (double)met[2u * s + 1u]; }
+                } else {
+                    const float* se = (const float*)[buf_se_out contents];
+                    for (uint32_t s = 0; s < R / 16; ++s) { sig += se[2 * s]; err_s += se[2 * s + 1]; }
+                }
                 out_snr = (float)(10.0 * std::log10(sig / std::max(err_s, 1e-18)));
-                snr_sum[b] += out_snr;
-                snr_cnt[b]++;
-                uint64_t wpm = (uint64_t)(R / 16) * (C / 128) * (b * 2u) * 32u;
+                int sb = snr_bucket(b);
+                snr_sum[sb] += out_snr;
+                snr_cnt[sb]++;
+                uint64_t wpm = tfq4::tfpw_proj_words(R, C, b);
                 memcpy(all_scales.data() + s_off, [buf_mat_sc contents], (size_t)N_SC * 2ULL);
                 memcpy(all_weights.data() + w_off, [buf_mat_pack contents], wpm * 4ULL);
             };
@@ -604,13 +676,15 @@ int main(int argc, char** argv) {
 
             double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_lyr).count();
             double tot = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_all).count();
-            printf("  [L%02d/%02d %s] %.3f GiB | 3b=%.2f(%d) 4b=%.2f(%d) 5b=%.2f(%d) dB | %.1fs (total %.1fm)\n",
-                   lyr, l_end, is_nvfp4 ? "NVFP4" : "MXFP8",
-                   (double)(endp + pade) / (double)(1ULL << 30),
-                   snr_cnt[3] ? snr_sum[3] / snr_cnt[3] : 0.0, snr_cnt[3] / 3,
-                   snr_cnt[4] ? snr_sum[4] / snr_cnt[4] : 0.0, snr_cnt[4] / 3,
-                   snr_cnt[5] ? snr_sum[5] / snr_cnt[5] : 0.0, snr_cnt[5] / 3,
-                   dt, tot / 60.0);
+            printf("  [L%02d/%02d %s] %.3f GiB |", lyr, l_end, is_nvfp4 ? "NVFP4" : "MXFP8",
+                   (double)(endp + pade) / (double)(1ULL << 30));
+            const char* lbl[5] = {"2b", "2.25b", "3b", "4b", "5b"};
+            for (int sb = 0; sb < 5; ++sb) {
+                if (snr_cnt[sb] || sb >= 2) {
+                    printf(" %s=%.2f(%d)", lbl[sb], snr_cnt[sb] ? snr_sum[sb] / snr_cnt[sb] : 0.0, snr_cnt[sb] / 3);
+                }
+            }
+            printf(" dB | %.1fs (total %.1fm)\n", dt, tot / 60.0);
             fflush(stdout);
         }
 

@@ -1,5 +1,5 @@
-// Standalone NVIDIA CUDA TFQ4-E8P (2.001 bpw) Parity & Bandwidth Benchmark.
-// Verifies BOTH table_kind=0 (trained 8-sign LUT) AND table_kind=2 (True QuIP# E8P, E8 + 1/4).
+// Standalone NVIDIA CUDA TFQ4-E8P (2.001 & 2.251 bpw) Parity & Bandwidth Benchmark.
+// Verifies table_kind=0 (trained 2.0b), table_kind=2 (True QuIP# E8P 2.0b), and table_kind=3 (True E8P-1024 2.25b).
 #include "../kernels/cuda/tfq4_cuda.cuh"
 #include "../converters/tfq4/tfq4_format.hpp"
 #include <cmath>
@@ -51,41 +51,53 @@ static void fwht128_f64(double* x) {
 }
 
 static std::vector<double> ref_dequant_e8p(
-    const uint32_t* W, const uint16_t* sc, const tfq4::PwV4E8Tables& T, uint32_t N, uint32_t K
+    const uint32_t* W, const uint16_t* sc, const uint16_t (*lut)[8],
+    uint32_t table_kind, uint32_t N, uint32_t K
 ) {
-    const bool is_true = (T.table_kind == tfq4::PWV4_TABLE_TRUE_E8P);
-    uint8_t m_par[256] = {};
+    const bool is_true = (table_kind == tfq4::PWV4_TABLE_TRUE_E8P || table_kind == tfq4::PWV4_TABLE_TRUE_E8P_1024);
+    const bool is_1024 = (table_kind == tfq4::PWV4_TABLE_TRUE_E8P_1024);
+    const uint32_t k_codes = is_1024 ? 1024u : 256u;
+    std::vector<uint8_t> m_par(k_codes, 0u);
     if (is_true) {
-        for (uint32_t k = 0; k < 256u; ++k) m_par[k] = tfq4::true_e8p_abs_parity(T.e8p_lut[k]);
+        for (uint32_t k = 0; k < k_codes; ++k) m_par[k] = tfq4::true_e8p_abs_parity(lut[k]);
     }
-    const uint32_t n_bc = K / 128u, wpr = K / 16u;
+    const uint32_t n_bc = K / 128u;
+    const uint32_t wpb = is_1024 ? 9u : 8u;
+    const uint32_t wpr = n_bc * wpb;
     std::vector<double> Wrot(static_cast<size_t>(N) * K, 0.0);
     for (uint32_t r = 0; r < N; ++r) {
         const uint32_t br = r / 128u;
-        for (uint32_t w = 0; w < wpr; ++w) {
-            const uint32_t bc = w / 8u;
+        for (uint32_t bc = 0; bc < n_bc; ++bc) {
             const double fsc = static_cast<double>(tfq4::f16_bits_to_f32(sc[static_cast<size_t>(br) * n_bc + bc]));
-            const uint32_t packed = W[static_cast<size_t>(r) * wpr + w];
-            const uint32_t c0 = packed & 0xFFFFu, c1 = packed >> 16;
-            for (int half_idx = 0; half_idx < 2; ++half_idx) {
-                const uint32_t code = half_idx ? c1 : c0;
-                const uint32_t idx = code & 255u;
-                if (is_true) {
-                    const uint32_t s7 = (code >> 8) & 0x7Fu;
-                    const uint32_t sm = s7 | (((static_cast<uint32_t>(__builtin_popcount(s7)) ^ m_par[idx]) & 1u) << 7);
-                    const double c_sgn = (code & 0x8000u) ? -1.0 : 1.0;
-                    for (int d = 0; d < 8; ++d) {
-                        const double mag = static_cast<double>(tfq4::f16_bits_to_f32(T.e8p_lut[idx][d]));
-                        const double sgn = ((sm >> d) & 1u) ? -1.0 : 1.0;
-                        const double q = c_sgn * (mag * sgn - 0.25);
-                        Wrot[static_cast<size_t>(r) * K + w * 16u + half_idx * 8u + d] = q * fsc;
+            const uint32_t* blk = W + static_cast<size_t>(r) * wpr + static_cast<size_t>(bc) * wpb;
+            const uint32_t hi_word = is_1024 ? blk[8] : 0u;
+            for (uint32_t sw = 0; sw < 8u; ++sw) {
+                const uint32_t packed = blk[sw];
+                const uint32_t c0 = packed & 0xFFFFu, c1 = packed >> 16;
+                for (int half_idx = 0; half_idx < 2; ++half_idx) {
+                    const uint32_t code = half_idx ? c1 : c0;
+                    uint32_t idx = code & 255u;
+                    if (is_1024) {
+                        const uint32_t j = sw * 2u + static_cast<uint32_t>(half_idx);
+                        idx |= ((hi_word >> (2u * j)) & 3u) << 8;
                     }
-                } else {
-                    const uint32_t sm = code >> 8;
-                    for (int d = 0; d < 8; ++d) {
-                        const double mag = static_cast<double>(tfq4::f16_bits_to_f32(T.e8p_lut[idx][d]));
-                        const double sgn = ((sm >> d) & 1u) ? -1.0 : 1.0;
-                        Wrot[static_cast<size_t>(r) * K + w * 16u + half_idx * 8u + d] = mag * sgn * fsc;
+                    if (is_true) {
+                        const uint32_t s7 = (code >> 8) & 0x7Fu;
+                        const uint32_t sm = s7 | (((static_cast<uint32_t>(__builtin_popcount(s7)) ^ m_par[idx]) & 1u) << 7);
+                        const double c_sgn = (code & 0x8000u) ? -1.0 : 1.0;
+                        for (int d = 0; d < 8; ++d) {
+                            const double mag = static_cast<double>(tfq4::f16_bits_to_f32(lut[idx][d]));
+                            const double sgn = ((sm >> d) & 1u) ? -1.0 : 1.0;
+                            const double q = c_sgn * (mag * sgn - 0.25);
+                            Wrot[static_cast<size_t>(r) * K + bc * 128u + sw * 16u + half_idx * 8u + d] = q * fsc;
+                        }
+                    } else {
+                        const uint32_t sm = code >> 8;
+                        for (int d = 0; d < 8; ++d) {
+                            const double mag = static_cast<double>(tfq4::f16_bits_to_f32(lut[idx][d]));
+                            const double sgn = ((sm >> d) & 1u) ? -1.0 : 1.0;
+                            Wrot[static_cast<size_t>(r) * K + bc * 128u + sw * 16u + half_idx * 8u + d] = mag * sgn * fsc;
+                        }
                     }
                 }
             }
@@ -125,21 +137,37 @@ static int run_verify_vectors(const std::string& vec_path) {
         std::fclose(vf);
         return 1;
     }
-    tfq4::PwV4E8Tables vtbl{};
-    if (std::fread(&vtbl, 1, sizeof(vtbl), vf) != sizeof(vtbl)) {
+    uint32_t thdr[16] = {};
+    if (std::fread(thdr, 4, 16, vf) != 16) {
+        fprintf(stderr, "Truncated VEC4 table header\n");
+        std::fclose(vf);
+        return 1;
+    }
+    const uint32_t magic = thdr[0], ver = thdr[1], k_codes = thdr[2], dim = thdr[3], table_kind = thdr[4];
+    if (magic != tfq4::MAGIC_PWV4 || ver != tfq4::FORMAT_VER || dim != 8u || table_kind > tfq4::PWV4_TABLE_MAX_KNOWN) {
+        fprintf(stderr, "Unsupported PWV4 table in VEC4 bundle: magic=0x%08x ver=%u table_kind=%u\n",
+                magic, ver, table_kind);
+        std::fclose(vf);
+        return 1;
+    }
+    const bool is_1024 = (table_kind == tfq4::PWV4_TABLE_TRUE_E8P_1024);
+    if ((is_1024 && k_codes != 1024u) || (!is_1024 && k_codes != 256u)) {
+        fprintf(stderr, "Mismatched k_codes=%u for table_kind=%u in VEC4 bundle\n", k_codes, table_kind);
+        std::fclose(vf);
+        return 1;
+    }
+    const size_t tbl_bytes = is_1024 ? sizeof(tfq4::PwV4E8Tables1024) : sizeof(tfq4::PwV4E8Tables);
+    const size_t lut_bytes = static_cast<size_t>(k_codes) * 8u * 2u;
+    std::vector<uint8_t> tbl_rest(tbl_bytes - 64u);
+    if (std::fread(tbl_rest.data(), 1, tbl_rest.size(), vf) != tbl_rest.size()) {
         fprintf(stderr, "Truncated VEC4 tables\n");
         std::fclose(vf);
         return 1;
     }
-    if (vtbl.magic != tfq4::MAGIC_PWV4 || vtbl.version != tfq4::FORMAT_VER || vtbl.table_kind > tfq4::PWV4_TABLE_MAX_KNOWN) {
-        fprintf(stderr, "Unsupported PWV4 table in VEC4 bundle: magic=0x%08x ver=%u table_kind=%u\n",
-                vtbl.magic, vtbl.version, vtbl.table_kind);
-        std::fclose(vf);
-        return 1;
-    }
     uint4* d_lut = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_lut, sizeof(vtbl.e8p_lut)));
-    CUDA_CHECK(cudaMemcpy(d_lut, vtbl.e8p_lut, sizeof(vtbl.e8p_lut), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMalloc(&d_lut, lut_bytes));
+    CUDA_CHECK(cudaMemcpy(d_lut, tbl_rest.data(), lut_bytes, cudaMemcpyHostToDevice));
+    const uint32_t wpb = is_1024 ? 9u : 8u;
 
     for (uint32_t ci = 0; ci < hdr[1]; ++ci) {
         uint32_t ch[10] = {};
@@ -164,11 +192,14 @@ static int run_verify_vectors(const std::string& vec_path) {
             std::fclose(vf);
             return 1;
         }
-        std::vector<uint32_t> W_loc(static_cast<size_t>(n_loc) * (k_loc / 16u));
+        const uint32_t full_wpr = (C / 128u) * wpb;
+        const uint32_t loc_wpr  = (k_loc / 128u) * wpb;
+        const uint32_t c_w_off  = (c_off / 128u) * wpb;
+        std::vector<uint32_t> W_loc(static_cast<size_t>(n_loc) * loc_wpr);
         for (uint32_t r = 0; r < n_loc; ++r) {
-            std::memcpy(&W_loc[static_cast<size_t>(r) * (k_loc / 16u)],
-                        &W[static_cast<size_t>(r_off + r) * (C / 16u) + (c_off / 16u)],
-                        (k_loc / 16u) * 4u);
+            std::memcpy(&W_loc[static_cast<size_t>(r) * loc_wpr],
+                        &W[static_cast<size_t>(r_off + r) * full_wpr + c_w_off],
+                        static_cast<size_t>(loc_wpr) * 4u);
         }
         std::vector<uint16_t> sc_loc(static_cast<size_t>(n_loc / 128u) * (k_loc / 128u));
         for (uint32_t br = 0; br < n_loc / 128u; ++br) {
@@ -198,7 +229,7 @@ static int run_verify_vectors(const std::string& vec_path) {
         // 1. FP16 input -> FP32 output
         CUDA_CHECK(tfq4_cuda::launch_dense_f16_f32(
             d_W, d_S, d_lut, d_X, d_Y, d_Xr,
-            vtbl.table_kind, rows, n_loc, k_loc, k_loc, n_loc, r_off, c_off
+            table_kind, rows, n_loc, k_loc, k_loc, n_loc, r_off, c_off
         ));
         CUDA_CHECK(cudaDeviceSynchronize());
         CUDA_CHECK(cudaMemcpy(got.data(), d_Y, got.size() * 4, cudaMemcpyDeviceToHost));
@@ -211,7 +242,7 @@ static int run_verify_vectors(const std::string& vec_path) {
         double cos_v = dot / (std::sqrt(na * nb) + 1e-30);
         if (cos_v < 0.99998) {
             fprintf(stderr, "FAIL CUDA VEC4 f16 table_kind=%u case=%u r_off=%u c_off=%u cos=%.8f\n",
-                    vtbl.table_kind, ci, r_off, c_off, cos_v);
+                    table_kind, ci, r_off, c_off, cos_v);
             cudaFree(d_W); cudaFree(d_S); cudaFree(d_X); cudaFree(d_Xbf); cudaFree(d_Xr); cudaFree(d_Y); cudaFree(d_lut);
             std::fclose(vf);
             return 1;
@@ -219,7 +250,7 @@ static int run_verify_vectors(const std::string& vec_path) {
         // 2. BF16 input -> FP32 output
         CUDA_CHECK(tfq4_cuda::launch_dense_bf16(
             d_W, d_S, d_lut, d_Xbf, d_Y, d_Xr,
-            vtbl.table_kind, rows, n_loc, k_loc, k_loc, n_loc, r_off, c_off, true
+            table_kind, rows, n_loc, k_loc, k_loc, n_loc, r_off, c_off, true
         ));
         CUDA_CHECK(cudaDeviceSynchronize());
         CUDA_CHECK(cudaMemcpy(got.data(), d_Y, got.size() * 4, cudaMemcpyDeviceToHost));
@@ -232,7 +263,7 @@ static int run_verify_vectors(const std::string& vec_path) {
         double cos_bf = dot / (std::sqrt(na * nb) + 1e-30);
         if (cos_bf < 0.9999) {
             fprintf(stderr, "FAIL CUDA VEC4 bf16 table_kind=%u case=%u r_off=%u c_off=%u cos=%.8f\n",
-                    vtbl.table_kind, ci, r_off, c_off, cos_bf);
+                    table_kind, ci, r_off, c_off, cos_bf);
             cudaFree(d_W); cudaFree(d_S); cudaFree(d_X); cudaFree(d_Xbf); cudaFree(d_Xr); cudaFree(d_Y); cudaFree(d_lut);
             std::fclose(vf);
             return 1;
@@ -243,7 +274,7 @@ static int run_verify_vectors(const std::string& vec_path) {
     cudaFree(d_lut);
     std::fclose(vf);
     printf("PASS CUDA TFQ4 golden vectors (table_kind=%u, %u cases, including r_off & c_off offsets)\n",
-           vtbl.table_kind, hdr[1]);
+           table_kind, hdr[1]);
     return 0;
 }
 
@@ -263,23 +294,34 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaGetDeviceProperties(&prop, 0));
 
     tfq4::PwV4E8Tables h_tbl_trained{}, h_tbl_true{};
+    tfq4::PwV4E8Tables1024 h_tbl_1024{};
     tfq4::build_e8p_tables(h_tbl_trained);
     tfq4::build_true_e8p_tables(h_tbl_true);
-    uint4 *d_lut_trained = nullptr, *d_lut_true = nullptr;
+    tfq4::build_true_e8p_1024_tables(h_tbl_1024);
+    if (std::memcmp(h_tbl_true.e8p_lut, h_tbl_1024.e8p_lut, sizeof(h_tbl_true.e8p_lut)) != 0) {
+        fprintf(stderr, "FAIL: first 256 entries of PwV4E8Tables1024 diverge from PwV4E8Tables (table_kind=2)\n");
+        return 1;
+    }
+
+    uint4 *d_lut_trained = nullptr, *d_lut_true = nullptr, *d_lut_1024 = nullptr;
     CUDA_CHECK(cudaMalloc(&d_lut_trained, sizeof(h_tbl_trained.e8p_lut)));
     CUDA_CHECK(cudaMalloc(&d_lut_true, sizeof(h_tbl_true.e8p_lut)));
+    CUDA_CHECK(cudaMalloc(&d_lut_1024, sizeof(h_tbl_1024.e8p_lut)));
     CUDA_CHECK(cudaMemcpy(d_lut_trained, h_tbl_trained.e8p_lut, sizeof(h_tbl_trained.e8p_lut), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_lut_true, h_tbl_true.e8p_lut, sizeof(h_tbl_true.e8p_lut), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_lut_1024, h_tbl_1024.e8p_lut, sizeof(h_tbl_1024.e8p_lut), cudaMemcpyHostToDevice));
 
-    // 1. Exact fp64 parity + bit-exact rows=1 == rows=16 == rows=17 + bf16 + fp16 sat for BOTH kind=0 and kind=2
+    // 1. Exact fp64 parity + bit-exact rows=1 == rows=16 == rows=17 + bf16 + fp16 sat for kind=0, 2, and 3
     const uint32_t N = 512u, K = 1024u, MAX_R = 17u;
     const uint32_t LDX_BF = K + 128u, LDO_BF = N + 128u;
     std::mt19937 rng(777);
-    std::vector<uint32_t> h_W(static_cast<size_t>(N) * (K / 16u));
+    std::vector<uint32_t> h_W20(static_cast<size_t>(N) * (K / 16u));
+    std::vector<uint32_t> h_W225(static_cast<size_t>(N) * (K / 128u) * 9u);
     std::vector<uint16_t> h_sc(static_cast<size_t>(N / 128u) * (K / 128u));
     std::vector<uint16_t> h_X(static_cast<size_t>(MAX_R) * K);
     std::vector<uint16_t> h_X_bf(static_cast<size_t>(MAX_R) * LDX_BF, 0u);
-    for (auto& w : h_W) w = rng();
+    for (auto& w : h_W20) w = rng();
+    for (auto& w : h_W225) w = rng();
     for (auto& s : h_sc) s = tfq4::f32_to_f16_bits(0.03f + 0.02f * (static_cast<float>(rng() & 255u) / 255.0f));
     for (uint32_t m = 0; m < MAX_R; ++m) {
         for (uint32_t c = 0; c < K; ++c) {
@@ -289,39 +331,46 @@ int main(int argc, char** argv) {
         }
     }
 
-    uint32_t* d_W = nullptr;
+    uint32_t *d_W20 = nullptr, *d_W225 = nullptr;
     __half *d_sc = nullptr, *d_X = nullptr, *d_xr = nullptr;
     uint16_t *d_X_bf = nullptr, *d_Y_bf = nullptr;
     float* d_Y = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_W, h_W.size() * 4));
+    CUDA_CHECK(cudaMalloc(&d_W20, h_W20.size() * 4));
+    CUDA_CHECK(cudaMalloc(&d_W225, h_W225.size() * 4));
     CUDA_CHECK(cudaMalloc(&d_sc, h_sc.size() * 2));
     CUDA_CHECK(cudaMalloc(&d_X, h_X.size() * 2));
     CUDA_CHECK(cudaMalloc(&d_X_bf, h_X_bf.size() * 2));
     CUDA_CHECK(cudaMalloc(&d_xr, static_cast<size_t>(MAX_R) * K * 2));
     CUDA_CHECK(cudaMalloc(&d_Y, static_cast<size_t>(MAX_R) * N * 4));
     CUDA_CHECK(cudaMalloc(&d_Y_bf, static_cast<size_t>(MAX_R) * LDO_BF * 2));
-    CUDA_CHECK(cudaMemcpy(d_W, h_W.data(), h_W.size() * 4, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_W20, h_W20.data(), h_W20.size() * 4, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_W225, h_W225.data(), h_W225.size() * 4, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_sc, h_sc.data(), h_sc.size() * 2, cudaMemcpyHostToDevice));
 
     struct KindCfg {
         const char* name;
+        const char* rate_lbl;
         uint32_t kind;
-        const tfq4::PwV4E8Tables* tbl;
+        uint32_t wpb;
+        const uint16_t (*lut_host)[8];
+        const uint32_t* w_host;
+        const uint32_t* d_W;
         const uint4* d_lut;
     };
     KindCfg kinds[] = {
-        {"trained/kind=0",  tfq4::PWV4_TABLE_LEGACY_TRAINED, &h_tbl_trained, d_lut_trained},
-        {"true-E8P/kind=2", tfq4::PWV4_TABLE_TRUE_E8P,       &h_tbl_true,    d_lut_true},
+        {"trained/kind=0",       "2.00b", tfq4::PWV4_TABLE_LEGACY_TRAINED, 8u, h_tbl_trained.e8p_lut, h_W20.data(),  d_W20,  d_lut_trained},
+        {"true-E8P/kind=2",      "2.00b", tfq4::PWV4_TABLE_TRUE_E8P,       8u, h_tbl_true.e8p_lut,    h_W20.data(),  d_W20,  d_lut_true},
+        {"true-E8P-1024/kind=3", "2.25b", tfq4::PWV4_TABLE_TRUE_E8P_1024,  9u, h_tbl_1024.e8p_lut,    h_W225.data(), d_W225, d_lut_1024},
     };
 
     for (auto& kc : kinds) {
         CUDA_CHECK(cudaMemcpy(d_X, h_X.data(), h_X.size() * 2, cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(d_X_bf, h_X_bf.data(), h_X_bf.size() * 2, cudaMemcpyHostToDevice));
-        auto W_ref = ref_dequant_e8p(h_W.data(), h_sc.data(), *kc.tbl, N, K);
+        auto W_ref = ref_dequant_e8p(kc.w_host, h_sc.data(), kc.lut_host, kc.kind, N, K);
 
         auto run_f16 = [&](uint32_t rows, std::vector<float>& out) {
             CUDA_CHECK(tfq4_cuda::launch_dense_f16_f32(
-                d_W, d_sc, kc.d_lut, d_X, d_Y, d_xr,
+                kc.d_W, d_sc, kc.d_lut, d_X, d_Y, d_xr,
                 kc.kind, rows, N, K, K, N, 0u, 0u
             ));
             CUDA_CHECK(cudaDeviceSynchronize());
@@ -356,8 +405,8 @@ int main(int argc, char** argv) {
             }
         }
         double cos_v = dot / (std::sqrt(na * nb) + 1e-30);
-        if (cos_v < 0.99999) {
-            fprintf(stderr, "FAIL TFQ4 CUDA (%s) fp64 parity cos=%.8f\n", kc.name, cos_v);
+        if (cos_v < 0.9999999) {
+            fprintf(stderr, "FAIL TFQ4 CUDA (%s) fp64 parity cos=%.8f (< 0.9999999)\n", kc.name, cos_v);
             return 1;
         }
 
@@ -365,13 +414,13 @@ int main(int argc, char** argv) {
         {
             std::vector<uint16_t> yb1(LDO_BF), yb16(static_cast<size_t>(16u) * LDO_BF);
             CUDA_CHECK(tfq4_cuda::launch_dense_bf16(
-                d_W, d_sc, kc.d_lut, d_X_bf, d_Y_bf, d_xr,
+                kc.d_W, d_sc, kc.d_lut, d_X_bf, d_Y_bf, d_xr,
                 kc.kind, 1u, N, K, LDX_BF, LDO_BF, 0u, 0u, false
             ));
             CUDA_CHECK(cudaDeviceSynchronize());
             CUDA_CHECK(cudaMemcpy(yb1.data(), d_Y_bf, LDO_BF * 2, cudaMemcpyDeviceToHost));
             CUDA_CHECK(tfq4_cuda::launch_dense_bf16(
-                d_W, d_sc, kc.d_lut, d_X_bf, d_Y_bf, d_xr,
+                kc.d_W, d_sc, kc.d_lut, d_X_bf, d_Y_bf, d_xr,
                 kc.kind, 16u, N, K, LDX_BF, LDO_BF, 0u, 0u, false
             ));
             CUDA_CHECK(cudaDeviceSynchronize());
@@ -414,7 +463,7 @@ int main(int argc, char** argv) {
             std::vector<uint16_t> big_x_bf(LDX_BF, h_f32_to_bf16(800000.0f));
             CUDA_CHECK(cudaMemcpy(d_X_bf, big_x_bf.data(), LDX_BF * 2, cudaMemcpyHostToDevice));
             CUDA_CHECK(tfq4_cuda::launch_dense_bf16(
-                d_W, d_sc, kc.d_lut, d_X_bf, d_Y_bf, d_xr,
+                kc.d_W, d_sc, kc.d_lut, d_X_bf, d_Y_bf, d_xr,
                 kc.kind, 1u, N, K, LDX_BF, LDO_BF, 0u, 0u, false
             ));
             CUDA_CHECK(cudaDeviceSynchronize());
@@ -428,11 +477,11 @@ int main(int argc, char** argv) {
             }
         }
 
-        printf("PASS tfq4_cuda_test (%s SM %d.%d: 2.0b %s fp64 parity cos=%.8f + bit-exact r1==r16==r17 + bf16 + fp16 sat)\n",
-               prop.name, prop.major, prop.minor, kc.name, cos_v);
+        printf("PASS tfq4_cuda_test (%s SM %d.%d: %s %s fp64 parity cos=%.8f + bit-exact r1==r16==r17 + bf16 + fp16 sat)\n",
+               prop.name, prop.major, prop.minor, kc.rate_lbl, kc.name, cos_v);
     }
 
-    cudaFree(d_W); cudaFree(d_sc); cudaFree(d_X); cudaFree(d_X_bf); cudaFree(d_xr); cudaFree(d_Y); cudaFree(d_Y_bf);
+    cudaFree(d_W20); cudaFree(d_W225); cudaFree(d_sc); cudaFree(d_X); cudaFree(d_X_bf); cudaFree(d_xr); cudaFree(d_Y); cudaFree(d_Y_bf);
 
     if (do_bench) {
         struct Shape { const char* name; uint32_t N, K; };
@@ -448,7 +497,7 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaEventCreate(&ev1));
         for (auto& kc : kinds) {
             for (auto& s : shapes) {
-                const size_t nw = static_cast<size_t>(s.N) * (s.K / 16u);
+                const size_t nw = static_cast<size_t>(s.N) * (s.K / 128u) * kc.wpb;
                 const size_t ns = static_cast<size_t>(s.N / 128u) * (s.K / 128u);
                 uint32_t* bw = nullptr;
                 __half* bsc = nullptr;
@@ -475,8 +524,8 @@ int main(int argc, char** argv) {
                     float total_ms = 0.0f;
                     CUDA_CHECK(cudaEventElapsedTime(&total_ms, ev0, ev1));
                     const double ms = static_cast<double>(total_ms) / 20.0;
-                    printf("  CUDA  TFQ4 %-15s %-10s [%5u x %5u] 2.0b rows=%2u | %5.1f MiB | %6.3f ms | %6.1f GB/s\n",
-                           kc.name, s.name, s.N, s.K, rows, bytes / (1024.0 * 1024.0), ms, (bytes / 1e9) / (ms / 1e3));
+                    printf("  CUDA  TFQ4 %-20s %-10s [%5u x %5u] %s rows=%2u | %5.1f MiB | %6.3f ms | %6.1f GB/s\n",
+                           kc.name, s.name, s.N, s.K, kc.rate_lbl, rows, bytes / (1024.0 * 1024.0), ms, (bytes / 1e9) / (ms / 1e3));
                 }
                 cudaFree(bw);
                 cudaFree(bsc);
@@ -491,5 +540,6 @@ int main(int argc, char** argv) {
 
     cudaFree(d_lut_trained);
     cudaFree(d_lut_true);
+    cudaFree(d_lut_1024);
     return 0;
 }
