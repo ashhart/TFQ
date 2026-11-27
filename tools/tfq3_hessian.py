@@ -25,13 +25,16 @@ Algorithm:
 from __future__ import annotations
 
 import argparse
+import glob
 import json
 import math
 import os
+import re
 import struct
 import sys
 import time
 import warnings
+from typing import Any
 import numpy as np
 import torch
 
@@ -47,6 +50,28 @@ MAGIC_PWV4 = 0x34565750
 MAGIC_TFP4 = 0x34504654
 HASH_MULT = 0x9E3779B1
 INIT_ST_BASE = 0x13579BDF
+
+HESSIAN_FORMAT_V1 = "tfq_hessian_v1"
+_HESSIAN_SAVE_DTYPES: dict[str, tuple[str, np.dtype, torch.dtype]] = {
+    "f32": ("F32", np.dtype("<f4"), torch.float32),
+    "float32": ("F32", np.dtype("<f4"), torch.float32),
+    "fp32": ("F32", np.dtype("<f4"), torch.float32),
+    "f64": ("F64", np.dtype("<f8"), torch.float64),
+    "float64": ("F64", np.dtype("<f8"), torch.float64),
+    "fp64": ("F64", np.dtype("<f8"), torch.float64),
+}
+_HESSIAN_LOAD_DTYPES: dict[str, tuple[np.dtype, torch.dtype]] = {
+    "F32": (np.dtype("<f4"), torch.float32),
+    "F64": (np.dtype("<f8"), torch.float64),
+    "F16": (np.dtype("<f2"), torch.float16),
+    "BF16": (np.dtype("<u2"), torch.bfloat16),
+}
+_MOE_EXPERT_GATE_UP_RE = re.compile(
+    r"^(?P<experts>.+\.experts)\.(?P<eid>\d+)\.(?P<proj>gate_proj|up_proj|gate|up)$"
+)
+_MLP_GATE_UP_RE = re.compile(
+    r"^(?P<mlp>.+\.(?:mlp|shared_experts))\.(?P<proj>gate_proj|up_proj|gate|up)$"
+)
 
 
 def align16k(n: int) -> int:
@@ -364,7 +389,7 @@ def quantize_tfq3_matrix(
         hd = torch.clamp(torch.diagonal(H_rot), min=1e-8)
         h_diag = hd / torch.mean(hd)
     elif H is not None:
-        H_pad = pad_hessian_128(H, C)
+        H_pad = pad_hessian_128(H.to(dtype=torch.float32).to(device=device), C)
         H_rot = rotate_hessian_torch(H_pad)
         H_inv = compute_h_inv_cholesky(H_rot, damp=damp)
         hd = torch.clamp(torch.diagonal(H_rot), min=1e-8)
@@ -727,12 +752,308 @@ def write_tfpn_shard(path: str, records: list[dict]) -> int:
     return tot_sz
 
 
+def _normalize_hessian_dtype(dtype: str) -> tuple[str, np.dtype, torch.dtype]:
+    key = str(dtype).strip().lower()
+    if key not in _HESSIAN_SAVE_DTYPES:
+        raise ValueError(f"Unsupported Hessian dtype '{dtype}' (expected 'f32' or 'f64')")
+    return _HESSIAN_SAVE_DTYPES[key]
+
+
+def _encode_hessian_metadata(metadata: dict[str, Any] | None, st_dtype: str) -> dict[str, str]:
+    """Encode metadata into Safetensors `__metadata__` (all string keys and values)."""
+    out: dict[str, str] = {"format": HESSIAN_FORMAT_V1, "dtype": st_dtype}
+    if metadata:
+        for k, v in metadata.items():
+            if v is None:
+                continue
+            ks = str(k)
+            if isinstance(v, str):
+                out[ks] = v
+            else:
+                out[ks] = json.dumps(v, separators=(",", ":"), sort_keys=True)
+    out["dtype"] = st_dtype
+    if "format" not in out or not out["format"]:
+        out["format"] = HESSIAN_FORMAT_V1
+    return out
+
+
+def _decode_hessian_metadata(raw_meta: dict[str, Any] | None) -> dict[str, Any]:
+    """Decode Safetensors `__metadata__` strings back into structured Python values."""
+    if not raw_meta:
+        return {}
+    out: dict[str, Any] = {}
+    for k, v in raw_meta.items():
+        if not isinstance(v, str):
+            out[k] = v
+            continue
+        if k == "tokens":
+            try:
+                out[k] = int(v)
+                continue
+            except ValueError:
+                pass
+        elif k == "damp":
+            try:
+                out[k] = float(v)
+                continue
+            except ValueError:
+                pass
+        elif k == "token_counts" or (len(v) >= 2 and v[0] in "{[" and v[-1] in "}]"):
+            try:
+                out[k] = json.loads(v)
+                continue
+            except json.JSONDecodeError:
+                pass
+        out[k] = v
+    return out
+
+
+def _merge_hessian_metadata(dst: dict[str, Any], src: dict[str, Any]) -> None:
+    """Merge metadata dicts across sharded Hessian files, preserving per-key token_counts."""
+    for k, v in src.items():
+        if k == "token_counts" and isinstance(v, dict):
+            existing = dst.get("token_counts")
+            if isinstance(existing, dict):
+                merged = dict(existing)
+                merged.update(v)
+                dst["token_counts"] = merged
+            else:
+                dst["token_counts"] = dict(v)
+        elif k == "dtype" and k in dst and dst[k] != v:
+            dst[k] = "mixed"
+        elif k not in dst or dst[k] is None:
+            dst[k] = v
+
+
+def save_hessians_safetensors(
+    path: str | os.PathLike[str],
+    hessians: dict[str, torch.Tensor | np.ndarray],
+    metadata: dict[str, Any] | None = None,
+    dtype: str = "f32",
+) -> int:
+    """
+    Save symmetric `[C, C]` calibration Hessians to a standalone Safetensors container (`tfq_hessian_v1`).
+
+    Zero dependencies beyond Python stdlib + NumPy/PyTorch. Supports both per-linear keys
+    (e.g. `model.layers.0.self_attn.q_proj`) and shared MoE keys (e.g.
+    `model.layers.3.mlp.experts.gate_up` + per-expert `down_proj`).
+
+    Returns total bytes written.
+    """
+    st_dtype, np_dtype, _ = _normalize_hessian_dtype(dtype)
+    path_str = os.fspath(path)
+    parent = os.path.dirname(os.path.abspath(path_str))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+    meta_encoded = _encode_hessian_metadata(metadata, st_dtype)
+    header: dict[str, Any] = {"__metadata__": meta_encoded}
+    blobs: list[bytes] = []
+    offset = 0
+
+    for key in sorted(hessians.keys()):
+        if key == "__metadata__":
+            raise ValueError("Hessian tensor key cannot be '__metadata__'")
+        val = hessians[key]
+        arr_raw = val.detach().cpu().numpy() if isinstance(val, torch.Tensor) else np.asarray(val)
+        if arr_raw.ndim != 2 or arr_raw.shape[0] != arr_raw.shape[1] or arr_raw.shape[0] <= 0:
+            raise ValueError(f"Hessian '{key}' must be a non-empty square 2D matrix [C, C], got shape {arr_raw.shape}")
+        arr = np.ascontiguousarray(arr_raw, dtype=np_dtype)
+        if not np.isfinite(arr).all():
+            raise ValueError(f"Hessian '{key}' contains non-finite values (NaN or Inf)")
+        raw = arr.tobytes()
+        header[key] = {
+            "dtype": st_dtype,
+            "shape": [int(arr.shape[0]), int(arr.shape[1])],
+            "data_offsets": [offset, offset + len(raw)],
+        }
+        blobs.append(raw)
+        offset += len(raw)
+
+    hdr_bytes = json.dumps(header, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    pad = (-len(hdr_bytes)) & 7
+    if pad:
+        hdr_bytes += b" " * pad
+
+    tmp_path = f"{path_str}.tmp"
+    with open(tmp_path, "wb") as f:
+        f.write(struct.pack("<Q", len(hdr_bytes)))
+        f.write(hdr_bytes)
+        for blob in blobs:
+            f.write(blob)
+    os.replace(tmp_path, path_str)
+    return 8 + len(hdr_bytes) + offset
+
+
+def _load_single_hessian_safetensors(
+    path: str,
+    allowed_keys: set[str] | None = None,
+) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
+    file_size = os.path.getsize(path)
+    if file_size < 8:
+        raise ValueError(f"Truncated Safetensors file: {path}")
+    with open(path, "rb") as f:
+        hdr_len = struct.unpack("<Q", f.read(8))[0]
+        if hdr_len == 0 or 8 + hdr_len > file_size:
+            raise ValueError(f"Invalid Safetensors header length ({hdr_len}) in {path}")
+        hdr = json.loads(f.read(hdr_len).decode("utf-8"))
+        if not isinstance(hdr, dict):
+            raise ValueError(f"Corrupt Safetensors JSON header in {path}")
+        base = 8 + hdr_len
+        data_len = file_size - base
+        meta = _decode_hessian_metadata(hdr.get("__metadata__"))
+        tensors: dict[str, torch.Tensor] = {}
+
+        for key, info in hdr.items():
+            if key == "__metadata__":
+                continue
+            if allowed_keys is not None and key not in allowed_keys:
+                continue
+            dt_name = info.get("dtype")
+            if dt_name not in _HESSIAN_LOAD_DTYPES:
+                raise ValueError(f"Unsupported Hessian dtype '{dt_name}' for '{key}' in {path}")
+            shape = info.get("shape")
+            if not isinstance(shape, list) or len(shape) != 2 or shape[0] != shape[1] or shape[0] <= 0:
+                raise ValueError(f"Invalid Hessian shape {shape} for '{key}' in {path}")
+            offsets = info.get("data_offsets")
+            if not isinstance(offsets, list) or len(offsets) != 2:
+                raise ValueError(f"Invalid data_offsets for '{key}' in {path}")
+            o0, o1 = int(offsets[0]), int(offsets[1])
+            np_dt, torch_dt = _HESSIAN_LOAD_DTYPES[dt_name]
+            expected_bytes = int(shape[0]) * int(shape[1]) * np_dt.itemsize
+            if o0 < 0 or o1 < o0 or o1 > data_len or (o1 - o0) != expected_bytes:
+                raise ValueError(
+                    f"Invalid byte slice [{o0}, {o1}) (expected {expected_bytes} bytes) for '{key}' in {path}"
+                )
+            f.seek(base + o0)
+            raw = f.read(o1 - o0)
+            arr = np.frombuffer(raw, dtype=np_dt).copy().reshape(int(shape[0]), int(shape[1]))
+            t = torch.from_numpy(arr)
+            if dt_name == "BF16":
+                t = t.view(torch_dt)
+            tensors[key] = t
+    return tensors, meta
+
+
+def load_hessians_safetensors(
+    path_or_dir: str | os.PathLike[str],
+) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
+    """
+    Load calibration Hessians from either:
+      - a single `.safetensors` file, OR
+      - a directory containing `hessians.safetensors.index.json`, `model.safetensors.index.json`,
+        or `*.safetensors` shards.
+
+    Returns `(hessians_dict, metadata)` with tensors preserving their stored precision (`F32` / `F64`).
+    """
+    target = os.fspath(path_or_dir)
+    if os.path.isfile(target):
+        return _load_single_hessian_safetensors(target)
+    if not os.path.isdir(target):
+        raise FileNotFoundError(f"Hessian path not found: {target}")
+
+    dir_real = os.path.realpath(target)
+    hessians: dict[str, torch.Tensor] = {}
+    metadata: dict[str, Any] = {}
+
+    index_path = None
+    for idx_name in ("hessians.safetensors.index.json", "model.safetensors.index.json"):
+        cand = os.path.join(target, idx_name)
+        if os.path.isfile(cand):
+            index_path = cand
+            break
+
+    if index_path is not None:
+        with open(index_path, "r", encoding="utf-8") as f:
+            idx_obj = json.load(f)
+        if isinstance(idx_obj.get("metadata"), dict):
+            _merge_hessian_metadata(metadata, _decode_hessian_metadata(idx_obj["metadata"]))
+        weight_map = idx_obj.get("weight_map")
+        if not isinstance(weight_map, dict) or not weight_map:
+            raise ValueError(f"Missing or empty 'weight_map' in {index_path}")
+        by_shard: dict[str, set[str]] = {}
+        for k, shard_rel in weight_map.items():
+            by_shard.setdefault(str(shard_rel), set()).add(str(k))
+        for shard_rel in sorted(by_shard.keys()):
+            shard_path = os.path.realpath(os.path.join(target, shard_rel))
+            if os.path.commonpath([dir_real, shard_path]) != dir_real:
+                raise ValueError(f"Shard path escapes directory: {shard_rel}")
+            if not os.path.isfile(shard_path):
+                raise FileNotFoundError(f"Missing Hessian shard referenced by index: {shard_path}")
+            keys = by_shard[shard_rel]
+            part_h, part_m = _load_single_hessian_safetensors(shard_path, allowed_keys=keys)
+            missing = keys - set(part_h.keys())
+            if missing:
+                raise KeyError(f"Shard {shard_rel} missing indexed Hessian keys: {sorted(missing)}")
+            hessians.update(part_h)
+            _merge_hessian_metadata(metadata, part_m)
+        return hessians, metadata
+
+    shard_files = sorted(glob.glob(os.path.join(target, "*.safetensors")))
+    if not shard_files:
+        raise FileNotFoundError(f"No .safetensors files found in {target}")
+    for shard_path in shard_files:
+        part_h, part_m = _load_single_hessian_safetensors(shard_path)
+        dup = set(hessians.keys()) & set(part_h.keys())
+        if dup:
+            raise ValueError(f"Duplicate Hessian keys across shards in {target}: {sorted(dup)}")
+        hessians.update(part_h)
+        _merge_hessian_metadata(metadata, part_m)
+    return hessians, metadata
+
+
+def resolve_hessian(
+    hessians: dict[str, torch.Tensor],
+    tensor_name: str,
+) -> torch.Tensor | None:
+    """
+    Resolve the input Hessian `[C, C]` for `tensor_name`:
+      1. Exact key match (`tensor_name`, then `.weight`-stripped / `.weight`-appended).
+      2. Shared MoE `gate_up` fallback for routed expert `gate_proj`/`up_proj`/`gate`/`up`
+         across standard (`model.layers.L.mlp.experts.E.{gate_proj,up_proj}`),
+         GLM (`model.language_model.layers.L.mlp.experts.E.{gate_proj,up_proj}`), and
+         Inkling-2 (`model.llm.layers.L.mlp.experts.E.{gate,up}`) naming conventions.
+      3. Shared dense / `shared_experts` `gate_up` fallback for `gate_proj`/`up_proj`.
+    Never maps `down_proj`/`down` to `gate_up`.
+    """
+    if tensor_name in hessians:
+        return hessians[tensor_name]
+    base = tensor_name[:-7] if tensor_name.endswith(".weight") else tensor_name
+    if base in hessians:
+        return hessians[base]
+    if f"{base}.weight" in hessians:
+        return hessians[f"{base}.weight"]
+
+    m_moe = _MOE_EXPERT_GATE_UP_RE.match(base)
+    if m_moe:
+        exp_prefix = m_moe.group("experts")
+        eid = m_moe.group("eid")
+        for cand in (
+            f"{exp_prefix}.gate_up",
+            f"{exp_prefix}.{eid}.gate_up",
+            f"{exp_prefix}.w13",
+        ):
+            if cand in hessians:
+                return hessians[cand]
+
+    m_mlp = _MLP_GATE_UP_RE.match(base)
+    if m_mlp:
+        cand = f"{m_mlp.group('mlp')}.gate_up"
+        if cand in hessians:
+            return hessians[cand]
+
+    return None
+
+
 def collect_linear_hessians(
     model: torch.nn.Module,
     input_ids_batches: list[torch.Tensor],
     module_names: list[str],
     device: torch.device,
-) -> dict[str, torch.Tensor]:
+    *,
+    dtype: torch.dtype = torch.float32,
+    return_counts: bool = False,
+) -> dict[str, torch.Tensor] | tuple[dict[str, torch.Tensor], dict[str, int]]:
     """Collect exact input Hessians H = (1/N) sum X^T X for selected nn.Linear modules via forward hooks."""
     name_set = set(module_names)
     H_sum: dict[str, torch.Tensor] = {}
@@ -765,15 +1086,28 @@ def collect_linear_hessians(
     for hk in hooks:
         hk.remove()
 
-    return {nm: (H_sum[nm] / max(H_cnt[nm], 1)).to(torch.float32) for nm in H_sum}
+    hessians = {nm: (H_sum[nm] / max(H_cnt[nm], 1)).to(dtype) for nm in H_sum}
+    if return_counts:
+        return hessians, H_cnt
+    return hessians
 
 
-if __name__ == "__main__":
+def _select_device(spec: str) -> torch.device:
+    if spec != "auto":
+        return torch.device(spec)
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    return torch.device("cpu")
+
+
+def _run_self_test() -> None:
     import subprocess
     import tempfile
 
     print("Running TFQ3 Hessian-Weighted Beam-Viterbi + LDLQ self-test...")
-    dev = torch.device("mps" if torch.backends.mps.is_available() else ("cuda" if torch.cuda.is_available() else "cpu"))
+    dev = _select_device("auto")
     with tempfile.TemporaryDirectory() as tmp:
         gen_bin = os.path.join(REPO_ROOT, "build", "tfq3-generic-convert")
         insp_bin = os.path.join(REPO_ROOT, "build", "tfq3-inspect")
@@ -801,6 +1135,18 @@ if __name__ == "__main__":
         tbl_path = os.path.join(o_dir, "pw_v3_tables.bin")
         tables = tfq3_ref.load_tables(tbl_path)
 
+        h_path = os.path.join(tmp, "hessians.safetensors")
+        save_hessians_safetensors(
+            h_path,
+            {"layer.0.proj": H},
+            metadata={"tokens": N, "damp": 0.01, "model_id": "self-test", "token_counts": {"layer.0.proj": N}},
+            dtype="f64",
+        )
+        loaded_h, loaded_meta = load_hessians_safetensors(h_path)
+        assert loaded_meta["format"] == HESSIAN_FORMAT_V1
+        H_reloaded = resolve_hessian(loaded_h, "layer.0.proj")
+        assert H_reloaded is not None
+
         for bits in (3, 4, 5):
             t0 = time.time()
             r_df = quantize_tfq3_matrix(W.to(dev), bits, tables, H=None, beam=16, topk=6, refine_scales=False)
@@ -808,7 +1154,7 @@ if __name__ == "__main__":
             H64, W64 = H.to(torch.float64), W.to(torch.float64)
             out_df = 10.0 * math.log10(float(torch.sum((W64 @ H64) * W64)) / float(torch.sum((diff_df @ H64) * diff_df)))
 
-            r_hl = quantize_tfq3_matrix(W.to(dev), bits, tables, H=H.to(dev), beam=16, topk=6, refine_scales=True)
+            r_hl = quantize_tfq3_matrix(W.to(dev), bits, tables, H=H_reloaded, beam=16, topk=6, refine_scales=True)
             dt = time.time() - t0
             shard = os.path.join(tmp, f"test_{bits}b.tffpw")
             write_tfpn_shard(shard, [{**r_hl, "name": "layer.0.proj"}])
@@ -821,3 +1167,164 @@ if __name__ == "__main__":
                 f"Data-Free Out-SNR={out_df:5.2f} dB -> Hessian-Viterbi+LDLQ Out-SNR={r_hl['output_snr_db']:5.2f} dB "
                 f"(+{r_hl['output_snr_db'] - out_df:.2f} dB) | TFPN max_err={max_diff:.2e} | {dt:.2f}s"
             )
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    ap = argparse.ArgumentParser(
+        description="TFQ3 Hessian-Weighted Beam-Viterbi + LDLQ encoder and Safetensors Hessian exporter/loader."
+    )
+    ap.add_argument("--self-test", action="store_true", help="Run built-in Hessian Viterbi+LDLQ & Safetensors self-test")
+    ap.add_argument("--model", help="Local model directory or Hugging Face repo id")
+    ap.add_argument("--out", help="Output directory for quantized TFPN shard and pw_v3_tables.bin")
+    ap.add_argument("--export-hessians", dest="export_hessians", help="Export captured Hessians to a .safetensors file")
+    ap.add_argument(
+        "--hessian-dtype",
+        dest="hessian_dtype",
+        choices=("f32", "f64"),
+        default="f32",
+        help="Floating-point precision for exported Hessians (default: f32)",
+    )
+    ap.add_argument(
+        "--capture-only",
+        dest="capture_only",
+        action="store_true",
+        help="Capture and export Hessians without running weight quantization",
+    )
+    ap.add_argument(
+        "--load-hessians",
+        dest="load_hessians",
+        help="Load precomputed Hessians from a .safetensors file or sharded directory",
+    )
+    ap.add_argument("--bits", type=int, choices=(3, 4, 5), default=4, help="TFQ3 bit width (default: 4)")
+    ap.add_argument("--beam", type=int, default=8, help="Beam width for trellis Viterbi search (default: 8)")
+    ap.add_argument("--topk", type=int, default=8, help="Spatial grid candidate count (default: 8)")
+    ap.add_argument("--damp", type=float, default=0.01, help="Diagonal Cholesky damping ratio (default: 0.01)")
+    ap.add_argument("--tokens", type=int, default=4096, help="Total calibration tokens to capture (default: 4096)")
+    ap.add_argument("--seq-len", dest="seq_len", type=int, default=512, help="Calibration sequence length (default: 512)")
+    ap.add_argument("--modules", help="Optional regex filter selecting nn.Linear module names")
+    ap.add_argument(
+        "--tables",
+        default=os.path.join(REPO_ROOT, "reference", "tables", "pw_v3_tables.bin"),
+        help="Path to pw_v3_tables.bin codebook",
+    )
+    ap.add_argument("--device", default="auto", choices=("auto", "cpu", "mps", "cuda"), help="Compute device")
+    ap.add_argument("--no-refine-scales", action="store_true", help="Disable closed-form Hessian scale refinement")
+    return ap
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = build_arg_parser()
+    args = ap.parse_args(argv)
+
+    if args.self_test or (
+        not args.model and not args.load_hessians and not args.export_hessians and not args.capture_only
+    ):
+        _run_self_test()
+        return 0
+
+    if args.capture_only and not args.export_hessians:
+        ap.error("--capture-only requires --export-hessians <path>")
+
+    dev = _select_device(args.device)
+    hessians: dict[str, torch.Tensor] = {}
+    meta: dict[str, Any] = {}
+    token_counts: dict[str, int] = {}
+
+    if args.load_hessians:
+        hessians, meta = load_hessians_safetensors(args.load_hessians)
+        print(
+            f"Loaded {len(hessians)} Hessian(s) from {args.load_hessians} "
+            f"(format={meta.get('format', 'unknown')}, dtype={meta.get('dtype', 'unknown')})"
+        )
+
+    model = None
+    linear_names: list[str] = []
+    if args.model:
+        from transformers import AutoModelForCausalLM
+
+        model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.bfloat16)
+        model.to(dev)
+        pat = re.compile(args.modules) if args.modules else None
+        linear_names = [
+            nm for nm, mod in model.named_modules()
+            if isinstance(mod, torch.nn.Linear) and (pat is None or pat.search(nm))
+        ]
+        if not linear_names:
+            raise SystemExit("No matching nn.Linear modules found in model")
+
+        if not args.load_hessians:
+            _, _, h_torch_dt = _normalize_hessian_dtype(args.hessian_dtype)
+            vocab = int(getattr(model.config, "vocab_size", 32000))
+            n_batches = max(1, (args.tokens + args.seq_len - 1) // args.seq_len)
+            g = torch.Generator().manual_seed(0)
+            batches = [
+                torch.randint(0, vocab, (1, args.seq_len), generator=g, dtype=torch.long)
+                for _ in range(n_batches)
+            ]
+            hessians, token_counts = collect_linear_hessians(
+                model, batches, linear_names, dev, dtype=h_torch_dt, return_counts=True
+            )
+            meta = {
+                "format": HESSIAN_FORMAT_V1,
+                "tokens": int(n_batches * args.seq_len),
+                "damp": float(args.damp),
+                "model_id": args.model,
+                "token_counts": token_counts,
+            }
+
+    if args.export_hessians:
+        if not hessians:
+            ap.error("--export-hessians requires --model (to capture) or --load-hessians (to re-export)")
+        export_meta = dict(meta)
+        export_meta.setdefault("format", HESSIAN_FORMAT_V1)
+        export_meta.setdefault("damp", float(args.damp))
+        if args.model:
+            export_meta.setdefault("model_id", args.model)
+        nbytes = save_hessians_safetensors(
+            args.export_hessians, hessians, metadata=export_meta, dtype=args.hessian_dtype
+        )
+        print(
+            f"Exported {len(hessians)} Hessian(s) ({args.hessian_dtype.upper()}, "
+            f"{nbytes / (1024 * 1024):.2f} MiB) -> {args.export_hessians}"
+        )
+
+    if args.capture_only:
+        return 0
+
+    if not args.model or not args.out:
+        if args.load_hessians and not args.model:
+            return 0
+        ap.error("Quantization requires both --model and --out (or pass --capture-only)")
+
+    os.makedirs(args.out, exist_ok=True)
+    tables = tfq3_ref.load_tables(args.tables)
+    dst_tables = os.path.join(args.out, "pw_v3_tables.bin")
+    if os.path.abspath(args.tables) != os.path.abspath(dst_tables):
+        with open(args.tables, "rb") as src_f, open(dst_tables, "wb") as dst_f:
+            dst_f.write(src_f.read())
+
+    mod_map = dict(model.named_modules())
+    records: list[dict[str, Any]] = []
+    for nm in linear_names:
+        W = mod_map[nm].weight.detach().to(device=dev, dtype=torch.float32)
+        H_mat = resolve_hessian(hessians, nm)
+        res = quantize_tfq3_matrix(
+            W,
+            args.bits,
+            tables,
+            H=H_mat,
+            damp=args.damp,
+            beam=args.beam,
+            topk=args.topk,
+            refine_scales=not args.no_refine_scales,
+        )
+        records.append({**res, "name": nm})
+
+    shard_path = os.path.join(args.out, "tfq3_hessian.tffpw")
+    tot = write_tfpn_shard(shard_path, records)
+    print(f"Wrote {len(records)} TFQ3 tensors ({args.bits}b, {tot / (1024 * 1024):.2f} MiB) -> {shard_path}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

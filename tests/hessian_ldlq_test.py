@@ -7,8 +7,11 @@ given every earlier block already fixed: t_rest = W_rest + E_done H_done,rest H_
 """
 from __future__ import annotations
 
+import json
 import os
+import struct
 import sys
+import tempfile
 import warnings
 import numpy as np
 import torch
@@ -47,8 +50,16 @@ def _setup(R: int, C: int, seed: int):
 def _synthetic_tables(seed: int) -> dict:
     rng = np.random.default_rng(seed)
     return {
-        "lut": {4: rng.standard_normal((1024, 2)).astype(np.float16)},
-        "c64": {4: rng.standard_normal((64, 4)).astype(np.float16)},
+        "lut": {
+            3: rng.standard_normal((256, 2)).astype(np.float16),
+            4: rng.standard_normal((1024, 2)).astype(np.float16),
+            5: rng.standard_normal((1024, 2)).astype(np.float16),
+        },
+        "c64": {
+            3: rng.standard_normal((64, 4)).astype(np.float16),
+            4: rng.standard_normal((64, 4)).astype(np.float16),
+            5: rng.standard_normal((64, 4)).astype(np.float16),
+        },
     }
 
 
@@ -137,6 +148,228 @@ def test_cholesky_failure_warns() -> None:
         H_inv = tfq3_h.compute_h_inv_cholesky(H)
     assert torch.equal(H_inv, torch.eye(2))
     assert any(issubclass(w.category, RuntimeWarning) and "Cholesky failed" in str(w.message) for w in caught)
+
+
+def test_hessian_safetensors_roundtrip_single_file_f32_and_f64() -> None:
+    H_q = _random_hessian(64, seed=11).to(torch.float64)
+    H_gu = _random_hessian(64, seed=12).to(torch.float64)
+    H_dn = _random_hessian(32, seed=13).to(torch.float64)
+    src = {
+        "model.layers.0.self_attn.q_proj": H_q,
+        "model.layers.3.mlp.experts.gate_up": H_gu,
+        "model.layers.3.mlp.experts.0.down_proj": H_dn,
+    }
+    meta_in = {
+        "tokens": 8192,
+        "damp": 0.01,
+        "model_id": "synthetic/moe-unit-test",
+        "token_counts": {
+            "model.layers.0.self_attn.q_proj": 8192,
+            "model.layers.3.mlp.experts.gate_up": 8192,
+            "model.layers.3.mlp.experts.0.down_proj": 512,
+        },
+    }
+    with tempfile.TemporaryDirectory(prefix="tfq_h_rt_") as tmp:
+        for dt_arg, st_dt, torch_dt in (("f32", "F32", torch.float32), ("f64", "F64", torch.float64)):
+            out_path = os.path.join(tmp, f"hessians_{dt_arg}.safetensors")
+            nbytes = tfq3_h.save_hessians_safetensors(out_path, src, metadata=meta_in, dtype=dt_arg)
+            assert nbytes == os.path.getsize(out_path)
+
+            # Inspect raw on-disk Safetensors header to ensure spec compliance
+            with open(out_path, "rb") as f:
+                hlen = struct.unpack("<Q", f.read(8))[0]
+                assert hlen % 8 == 0, "Expected 8-byte aligned Safetensors JSON header"
+                raw_hdr = json.loads(f.read(hlen).decode("utf-8"))
+            raw_meta = raw_hdr["__metadata__"]
+            assert all(isinstance(k, str) and isinstance(v, str) for k, v in raw_meta.items())
+            assert raw_meta["format"] == tfq3_h.HESSIAN_FORMAT_V1
+            assert raw_meta["dtype"] == st_dt
+            for k in src:
+                assert raw_hdr[k]["dtype"] == st_dt
+
+            loaded, meta_out = tfq3_h.load_hessians_safetensors(out_path)
+            assert set(loaded.keys()) == set(src.keys())
+            for k, orig in src.items():
+                assert loaded[k].dtype == torch_dt
+                assert torch.equal(loaded[k], orig.to(torch_dt))
+            assert meta_out["format"] == tfq3_h.HESSIAN_FORMAT_V1
+            assert meta_out["dtype"] == st_dt
+            assert meta_out["tokens"] == meta_in["tokens"]
+            assert meta_out["damp"] == meta_in["damp"]
+            assert meta_out["model_id"] == meta_in["model_id"]
+            assert meta_out["token_counts"] == meta_in["token_counts"]
+
+        # Negative validation checks
+        bad_path = os.path.join(tmp, "bad.safetensors")
+        for bad_h, bad_dt in (
+            ({"rect": torch.zeros(4, 8)}, "f32"),
+            ({"nan": torch.tensor([[1.0, float("nan")], [float("nan"), 1.0]])}, "f32"),
+            ({"ok": torch.eye(4)}, "int8"),
+        ):
+            try:
+                tfq3_h.save_hessians_safetensors(bad_path, bad_h, dtype=bad_dt)
+                raise AssertionError(f"Expected ValueError for {bad_h.keys()} / {bad_dt}")
+            except ValueError:
+                pass
+
+
+def test_hessian_safetensors_sharded_directories() -> None:
+    h0 = _random_hessian(32, seed=21)
+    h1 = _random_hessian(32, seed=22)
+    h2 = _random_hessian(64, seed=23)
+    with tempfile.TemporaryDirectory(prefix="tfq_h_shards_") as tmp:
+        # 1) Directory with hessians.safetensors.index.json
+        d_hidx = os.path.join(tmp, "by_hessians_index")
+        os.makedirs(d_hidx)
+        tfq3_h.save_hessians_safetensors(
+            os.path.join(d_hidx, "hessians-00001-of-00002.safetensors"),
+            {"model.layers.0.self_attn.q_proj": h0},
+            metadata={"tokens": 2048, "damp": 0.01, "model_id": "sharded-test", "token_counts": {"model.layers.0.self_attn.q_proj": 2048}},
+            dtype="f32",
+        )
+        tfq3_h.save_hessians_safetensors(
+            os.path.join(d_hidx, "hessians-00002-of-00002.safetensors"),
+            {"model.layers.3.mlp.experts.gate_up": h1, "model.layers.3.mlp.experts.0.down_proj": h2},
+            metadata={
+                "tokens": 2048,
+                "damp": 0.01,
+                "model_id": "sharded-test",
+                "token_counts": {
+                    "model.layers.3.mlp.experts.gate_up": 2048,
+                    "model.layers.3.mlp.experts.0.down_proj": 128,
+                },
+            },
+            dtype="f32",
+        )
+        with open(os.path.join(d_hidx, "hessians.safetensors.index.json"), "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "metadata": {"format": tfq3_h.HESSIAN_FORMAT_V1},
+                    "weight_map": {
+                        "model.layers.0.self_attn.q_proj": "hessians-00001-of-00002.safetensors",
+                        "model.layers.3.mlp.experts.gate_up": "hessians-00002-of-00002.safetensors",
+                        "model.layers.3.mlp.experts.0.down_proj": "hessians-00002-of-00002.safetensors",
+                    },
+                },
+                f,
+            )
+        got, meta = tfq3_h.load_hessians_safetensors(d_hidx)
+        assert torch.equal(got["model.layers.0.self_attn.q_proj"], h0.to(torch.float32))
+        assert torch.equal(got["model.layers.3.mlp.experts.gate_up"], h1.to(torch.float32))
+        assert torch.equal(got["model.layers.3.mlp.experts.0.down_proj"], h2.to(torch.float32))
+        assert meta["token_counts"] == {
+            "model.layers.0.self_attn.q_proj": 2048,
+            "model.layers.3.mlp.experts.gate_up": 2048,
+            "model.layers.3.mlp.experts.0.down_proj": 128,
+        }
+
+        # 2) Directory with model.safetensors.index.json
+        os.rename(
+            os.path.join(d_hidx, "hessians.safetensors.index.json"),
+            os.path.join(d_hidx, "model.safetensors.index.json"),
+        )
+        got2, _ = tfq3_h.load_hessians_safetensors(d_hidx)
+        assert set(got2.keys()) == set(got.keys())
+        for k in got:
+            assert torch.equal(got2[k], got[k])
+
+        # 3) Directory with plain *.safetensors shards (no index file)
+        os.remove(os.path.join(d_hidx, "model.safetensors.index.json"))
+        got3, meta3 = tfq3_h.load_hessians_safetensors(d_hidx)
+        assert set(got3.keys()) == set(got.keys())
+        assert meta3["token_counts"]["model.layers.3.mlp.experts.0.down_proj"] == 128
+
+        # 4) Duplicate keys in unindexed directory rejected
+        tfq3_h.save_hessians_safetensors(
+            os.path.join(d_hidx, "dup.safetensors"),
+            {"model.layers.0.self_attn.q_proj": h0},
+            dtype="f32",
+        )
+        try:
+            tfq3_h.load_hessians_safetensors(d_hidx)
+            raise AssertionError("Expected ValueError on duplicate Hessian key across shards")
+        except ValueError:
+            pass
+
+
+def test_resolve_hessian_exact_and_moe_gate_up_fallback() -> None:
+    h_exact = torch.eye(16) * 2.0
+    h_std = torch.eye(16) * 3.0
+    h_glm = torch.eye(16) * 4.0
+    h_ink = torch.eye(16) * 5.0
+    h_down = torch.eye(8) * 6.0
+    hessians = {
+        "model.layers.3.mlp.experts.0.gate_proj": h_exact,
+        "model.layers.3.mlp.experts.gate_up": h_std,
+        "model.layers.3.mlp.experts.0.down_proj": h_down,
+        "model.language_model.layers.12.mlp.experts.gate_up": h_glm,
+        "model.llm.layers.5.mlp.experts.gate_up": h_ink,
+    }
+
+    # Exact match beats shared gate_up fallback
+    assert torch.equal(tfq3_h.resolve_hessian(hessians, "model.layers.3.mlp.experts.0.gate_proj"), h_exact)
+    assert torch.equal(tfq3_h.resolve_hessian(hessians, "model.layers.3.mlp.experts.0.gate_proj.weight"), h_exact)
+
+    # Standard MoE fallback (gate_proj & up_proj, with or without .weight)
+    assert torch.equal(tfq3_h.resolve_hessian(hessians, "model.layers.3.mlp.experts.17.gate_proj"), h_std)
+    assert torch.equal(tfq3_h.resolve_hessian(hessians, "model.layers.3.mlp.experts.17.up_proj"), h_std)
+    assert torch.equal(tfq3_h.resolve_hessian(hessians, "model.layers.3.mlp.experts.17.up_proj.weight"), h_std)
+
+    # GLM MoE fallback
+    assert torch.equal(tfq3_h.resolve_hessian(hessians, "model.language_model.layers.12.mlp.experts.42.gate_proj"), h_glm)
+    assert torch.equal(tfq3_h.resolve_hessian(hessians, "model.language_model.layers.12.mlp.experts.42.up_proj"), h_glm)
+
+    # Inkling-2 MoE fallback
+    assert torch.equal(tfq3_h.resolve_hessian(hessians, "model.llm.layers.5.mlp.experts.99.gate"), h_ink)
+    assert torch.equal(tfq3_h.resolve_hessian(hessians, "model.llm.layers.5.mlp.experts.99.up"), h_ink)
+    assert torch.equal(tfq3_h.resolve_hessian(hessians, "model.llm.layers.5.mlp.experts.99.up.weight"), h_ink)
+
+    # down_proj / down exact match works, and NEVER falls back to gate_up
+    assert torch.equal(tfq3_h.resolve_hessian(hessians, "model.layers.3.mlp.experts.0.down_proj"), h_down)
+    assert tfq3_h.resolve_hessian(hessians, "model.layers.3.mlp.experts.17.down_proj") is None
+    assert tfq3_h.resolve_hessian(hessians, "model.language_model.layers.12.mlp.experts.42.down_proj") is None
+    assert tfq3_h.resolve_hessian(hessians, "model.llm.layers.5.mlp.experts.99.down") is None
+
+
+def test_ldlq_end_to_end_parity_in_memory_vs_f64_safetensors() -> None:
+    """Encoding with in-memory Hessian vs reloaded F64 Safetensors Hessian must produce 100% identical TFQ3 words & scales."""
+    R, C = 128, 384
+    g = torch.Generator().manual_seed(77)
+    W = torch.randn(R, C, generator=g) * 0.02
+    H_mem = _random_hessian(C, seed=78).to(torch.float64)
+    tables = _synthetic_tables(79)
+
+    with tempfile.TemporaryDirectory(prefix="tfq_h_ldlq_") as tmp:
+        h_file = os.path.join(tmp, "hessians_f64.safetensors")
+        tfq3_h.save_hessians_safetensors(
+            h_file,
+            {"model.layers.3.mlp.experts.gate_up": H_mem},
+            metadata={"tokens": 1536, "damp": 0.01, "model_id": "parity-test"},
+            dtype="f64",
+        )
+        # Also verify CLI --load-hessians -> --export-hessians --capture-only round-trip
+        h_reexport = os.path.join(tmp, "reexported_f64.safetensors")
+        rc = tfq3_h.main([
+            "--load-hessians", h_file,
+            "--export-hessians", h_reexport,
+            "--hessian-dtype", "f64",
+            "--capture-only",
+        ])
+        assert rc == 0
+
+        loaded, meta = tfq3_h.load_hessians_safetensors(h_reexport)
+        assert meta["dtype"] == "F64"
+        H_reloaded = tfq3_h.resolve_hessian(loaded, "model.layers.3.mlp.experts.9.gate_proj")
+        assert H_reloaded is not None
+        assert H_reloaded.dtype == torch.float64
+        assert torch.equal(H_reloaded, H_mem)
+
+        for bits in (3, 4, 5):
+            r_mem = tfq3_h.quantize_tfq3_matrix(W, bits, tables, H=H_mem, damp=0.01, beam=4, topk=4, refine_scales=True)
+            r_disk = tfq3_h.quantize_tfq3_matrix(W, bits, tables, H=H_reloaded, damp=0.01, beam=4, topk=4, refine_scales=True)
+            assert np.array_equal(r_mem["words"], r_disk["words"]), f"{bits}b packed words differ after F64 reload"
+            assert np.array_equal(r_mem["scales"], r_disk["scales"]), f"{bits}b fp16 scales differ after F64 reload"
+            assert torch.equal(r_mem["W_hat"], r_disk["W_hat"]), f"{bits}b reconstructed W_hat differs after F64 reload"
 
 
 if __name__ == "__main__":
