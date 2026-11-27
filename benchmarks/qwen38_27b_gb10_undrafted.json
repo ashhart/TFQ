@@ -1,0 +1,65 @@
+{
+  "benchmark": "qwen38_27b_gb10_undrafted_head_to_head",
+  "date_utc": "2026-11-27",
+  "hardware": {
+    "gpu": "NVIDIA GB10 (sm_121, 122 GiB unified LPDDR5X)",
+    "driver": "580.173.02",
+    "os": "Ubuntu 24.04.5 LTS"
+  },
+  "runtime": {
+    "engine": "tensorfold-native 1.3.6",
+    "backend": "cuda",
+    "drafter": "none",
+    "serial": true,
+    "context": 8192,
+    "parallel": 1,
+    "prompt_cache_gib": 0,
+    "temperature": 0.0,
+    "decode_protocol": "community-v2 (3 repeats x 256 tokens after warm-up, 0 drafted tokens across 1530 rounds)"
+  },
+  "models": {
+    "Qwen3.8-27B-TFQ3": {
+      "disk_total_bytes": 15424476498,
+      "disk_total_gib": 14.365,
+      "disk_tffpw_gib": 11.923,
+      "disk_residual_safetensors_gib": 2.417,
+      "load_seconds": 11.02,
+      "undrafted_decode_code_tps": [14.89, 15.01, 14.95],
+      "undrafted_decode_code_median_tps": 14.95,
+      "undrafted_decode_chat_tps": [14.95, 14.94, 14.90],
+      "undrafted_decode_chat_median_tps": 14.94,
+      "ttft_code_seconds": 0.082,
+      "ttft_chat_seconds": 0.153,
+      "prefill_2526_tok_runs": [
+        {"prompt_tokens": 2526, "seconds": 11.4333, "prefill_tps": 220.93},
+        {"prompt_tokens": 2526, "seconds": 11.4498, "prefill_tps": 220.61},
+        {"prompt_tokens": 2526, "seconds": 11.4817, "prefill_tps": 220.00}
+      ],
+      "prefill_2526_tok_median_tps": 220.6
+    },
+    "Qwen3.8-27B-MLX-4bit": {
+      "disk_total_bytes": 16081520742,
+      "disk_total_gib": 14.977,
+      "disk_tffpw_gib": 0.0,
+      "disk_residual_safetensors_gib": 14.952,
+      "load_seconds": 10.51,
+      "undrafted_decode_code_tps": [14.92, 14.59, 14.78],
+      "undrafted_decode_code_median_tps": 14.78,
+      "undrafted_decode_chat_tps": [14.92, 14.93, 14.92],
+      "undrafted_decode_chat_median_tps": 14.92,
+      "ttft_code_seconds": 0.074,
+      "ttft_chat_seconds": 0.099,
+      "prefill_2526_tok_runs": [
+        {"prompt_tokens": 2526, "seconds": 1.8026, "prefill_tps": 1401.30},
+        {"prompt_tokens": 2526, "seconds": 1.7997, "prefill_tps": 1403.54},
+        {"prompt_tokens": 2526, "seconds": 1.8076, "prefill_tps": 1397.42}
+      ],
+      "prefill_2526_tok_median_tps": 1401.3
+    }
+  },
+  "notes": [
+    "Undrafted 1-to-1 comparison on identical NVIDIA GB10 hardware and runtime (0 drafted tokens).",
+    "TFQ3 is 0.612 GiB (-4.1%) smaller on disk (14.365 vs 14.977 GiB) and matches/edges MLX-4bit on undrafted decode (14.95/14.94 vs 14.78/14.92 tok/s).",
+    "In TensorFold 1.3.6 CUDA, long-prompt prefill for dense TFQ3 currently runs at 220.6 tok/s vs 1,401.3 tok/s for MLX-4bit; standalone tiled Tensor Core prefill in src/kernels/cuda/tfq3_cuda.cuh is the target path to close that gap."
+  ]
+}

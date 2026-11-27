@@ -61,14 +61,21 @@ tfq3 doctor
 
 TFQ checkpoints are **not locked to TensorFold**:
 
+```bash
+# Install the Python package (bundles canonical tables, Metal shaders for zero-build MPS fused ops, MoE loader & vLLM plugin):
+pip install .
+```
+
 ```python
-# Standard PyTorch + Hugging Face Transformers (zero TensorFold dependency — Metal/MPS, CPU, or CUDA)
-from integrations.pytorch.tfq_torch import load_tfq_into_hf
-model = load_tfq_into_hf("./Qwen2.5-1.5B-TFQ3", device="mps", cache_decoded=True)
+# Standard PyTorch + Hugging Face Transformers (zero TensorFold dependency):
+# - Apple Silicon MPS: zero-build fused Metal kernels via torch.mps.compile_shader (3/4/5b TFQ3 & 2b TFQ4 kind=0/2)
+# - NVIDIA CUDA: fused Tensor Core / E8P kernels via tfq3_cuda_ext (or CPU/MPS reference fallback)
+from tfq3 import load_tfq_into_hf, TfpwCheckpoint
+model = load_tfq_into_hf("./Qwen2.5-1.5B-TFQ3", device="mps")
 ```
 
 ```bash
-# Optional native PyTorch CUDA extension (`src/kernels/cuda/tfq3_cuda.cuh`, zero BF16 weight expansion):
+# Optional native PyTorch CUDA extension (`tfq3_cuda.cuh` + `tfq4_cuda.cuh`, zero BF16 weight expansion):
 pip install --no-build-isolation -e integrations/pytorch
 
 # Or serve natively on Mac (Metal) or NVIDIA GPU (CUDA) with TensorFold:
@@ -136,6 +143,7 @@ make test-tfq4-metal   # fp64 Metal parity (2.001 bpw 8D E8-initialized Voronoi,
 make install CUDA_ARCH=sm_121
 make test CUDA_ARCH=sm_121
 make test-cuda CUDA_ARCH=sm_121
+make test-tfq4-cuda CUDA_ARCH=sm_121
 ```
 
 ---
@@ -144,9 +152,10 @@ make test-cuda CUDA_ARCH=sm_121
 
 - **[`docs/HOW_IT_WORKS.md`](docs/HOW_IT_WORKS.md)** — Mathematical formulation of `2D FWHT-128`, `2D-AffineCoset/half4`, state-hash split-K resume, and Metal/CUDA execution.
 - **[`docs/FORMAT_SPEC.md`](docs/FORMAT_SPEC.md)** — Byte-level binary specification for `PWV3`/`PWV4` tables and `TFPN`/`TFPW`/`TFP4` shards.
-- **[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md)** — Full provenance-tagged benchmarks (`[MEASURED]` / `[SOURCE-INSPECTED]` / `[NOT VERIFIED]`).
-- **[`docs/TFQ4_SUB3BIT.md`](docs/TFQ4_SUB3BIT.md)** — Sub-3-bit (`2.001 bpw`) `TFQ4-E8P` cold-expert lattice format and benchmarks.
-- **[`tools/tfq3_hessian.py`](tools/tfq3_hessian.py)** — Optional calibration-aware Hessian-weighted Beam-Viterbi + LDLQ encoder (`TFPN`/`TFP4` compatible).
+- **[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md)** — Full provenance-tagged benchmarks (`[MEASURED]` / `[SOURCE-INSPECTED]` / `[NOT VERIFIED]`), plus undrafted GB10 dense receipt [`benchmarks/qwen38_27b_gb10_undrafted.json`](benchmarks/qwen38_27b_gb10_undrafted.json).
+- **[`docs/TFQ4_SUB3BIT.md`](docs/TFQ4_SUB3BIT.md)** — Sub-3-bit (`2.001 bpw`) `TFQ4-E8P` cold-expert lattice format (both trained `table_kind=0/1` and True QuIP# E8P `table_kind=2`) and Metal/CUDA kernels.
+- **[`docs/TENSORFOLD_LOADER_SPEC.md`](docs/TENSORFOLD_LOADER_SPEC.md)** — Runtime integration spec for GLM `--keep-nonmoe-bf16` and Inkling-2 `TFPW` v3 checkpoints.
+- **[`tools/tfq3_hessian.py`](tools/tfq3_hessian.py)** — Optional calibration-aware Hessian-weighted Beam-Viterbi + LDLQ encoder (`TFPN`/`TFP4`) and Safetensors Hessian exporter (`--export-hessians` / `--load-hessians`).
 - **[`tools/bench_quantizers.py`](tools/bench_quantizers.py)** — Reproducible WikiText-2 PPL, full-vocab KL, and real-activation Output SNR benchmark + SHA-256 provenance generator.
 - **[`integrations/`](integrations/README.md)** — Standalone PyTorch, Hugging Face `transformers`, and vLLM integrations.
 - **[`reference/tfq3_reference.py`](reference/tfq3_reference.py)** & **[`reference/tfq4_lattice.py`](reference/tfq4_lattice.py)** — Pure-Python NumPy reference decoders.
