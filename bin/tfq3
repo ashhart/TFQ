@@ -516,7 +516,6 @@ run_convert() {
         glm)
             case "$glm_mode" in heat43|heat443|uniform4|uniform3) ;; *) die "invalid --glm-mode '${glm_mode}' (expected heat43, heat443, uniform4, or uniform3)" ;; esac
             if [ "$fmt_kind" != "fp8" ] && [ "$auto_res" != "q8" ]; then  # a BF16 checkpoint
-                [ "$(uname -s)" != "Darwin" ] || die "GLM from a BF16 checkpoint is CUDA-only (the Metal GLM converter reads FP8 experts)"
                 [ "$keep_nonmoe_bf16" -eq 1 ] || [ -n "$nonmoe_model" ] || die "the GLM non-MoE pass reads MLX 8-bit tensors, which a BF16 checkpoint does not have: pass --keep-nonmoe-bf16, or --nonmoe-model <MLX 8-bit dir>"
             fi
             local conv_bin

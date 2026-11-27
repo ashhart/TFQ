@@ -366,8 +366,9 @@ def test_cli_ernie(tfq3_cli: str, tmp: str) -> None:
 
 
 def test_cli_glm_bf16(tfq3_cli: str, tmp: str) -> None:
-    # GLM from a BF16 checkpoint, against stub binaries: CUDA-only, and only with --keep-nonmoe-bf16 or --nonmoe-model
-    # (the non-MoE pass reads MLX 8-bit tensors); an FP8 checkpoint keeps its plan
+    # GLM from a BF16 checkpoint, against stub binaries: works on both Metal and CUDA when
+    # --keep-nonmoe-bf16 or --nonmoe-model is passed (the non-MoE pass reads MLX 8-bit tensors);
+    # an FP8 checkpoint keeps its plan
     src = os.path.join(tmp, "glm_bf16_cli")
     lib = os.path.join(tmp, "glm_lib")
     os.makedirs(src)
@@ -382,10 +383,6 @@ def test_cli_glm_bf16(tfq3_cli: str, tmp: str) -> None:
         os.chmod(p, 0o755)
     env = dict(os.environ, TFQ3_LIB_DIR=lib)
     keep = ["--glm-mode", "uniform4", "--keep-nonmoe-bf16", "--dry-run"]
-    if platform.system() == "Darwin":
-        assert "CUDA-only" in run([tfq3_cli, src, *keep], expect_ok=False, env=env).stderr
-        print("PASS CLI GLM BF16 (refused on Metal)")
-        return
     err = run([tfq3_cli, src, "--dry-run"], expect_ok=False, env=env).stderr
     assert "--keep-nonmoe-bf16" in err and "--nonmoe-model" in err, err
     out = run([tfq3_cli, src, *keep], env=env).stdout
@@ -421,11 +418,12 @@ def write_safetensors(path: str, tensors: list[tuple[str, str, list[int], bytes]
 
 
 def test_glm_bf16_source(inspect_bin: str, tmp: str) -> None:
-    """The GLM CUDA converter reads BF16 routed experts: the same values as FP8 (power-of-two block scales,
-    so every product is exact in BF16) give byte-identical layer shards; a wrong BF16 shape is refused."""
-    conv = os.path.join(REPO_ROOT, "build", "tfq3-glm-convert-cuda")
-    if platform.system() != "Linux" or not os.path.isfile(conv):
-        print("SKIP GLM BF16 source (needs Linux and build/tfq3-glm-convert-cuda)")
+    """The GLM Metal and CUDA converters read BF16 routed experts: the same values as FP8 (power-of-two block
+    scales, so every product is exact in BF16) give byte-identical layer shards; a wrong BF16 shape is refused."""
+    suffix = "" if platform.system() == "Darwin" else "-cuda"
+    conv = os.path.join(REPO_ROOT, "build", f"tfq3-glm-convert{suffix}")
+    if not os.path.isfile(conv):
+        print(f"SKIP GLM BF16 source (missing {conv})")
         return
     rng = np.random.default_rng(53)
     n_exp, H, I = 4, 256, 128
@@ -456,10 +454,13 @@ def test_glm_bf16_source(inspect_bin: str, tmp: str) -> None:
         assert f"src={'BF16' if label == 'bf16' else 'F8_E4M3'}" in log, log
         run([inspect_bin, "-v", out])
         outs[label] = out
+    golden_glm_sha = "1f1fad1569e477a8dbe71eea9892595a266c88b994ed7287cd6fbea7e66c00e4"
     for fn in ("layer_03.tffpw", "pw_v3_tables.bin"):
         a = open(os.path.join(outs["fp8"], fn), "rb").read()
         b = open(os.path.join(outs["bf16"], fn), "rb").read()
         assert a == b, f"GLM BF16 source: {fn} differs from the FP8 source's ({len(a)} vs {len(b)} B)"
+    got_glm_sha = sha256_file(os.path.join(outs["bf16"], "layer_03.tffpw"))
+    assert got_glm_sha == golden_glm_sha, f"GLM Metal==CUDA SHA-256 mismatch: {got_glm_sha} != {golden_glm_sha}"
     bad = os.path.join(tmp, "glm_bf16_bad")
     os.makedirs(bad)
     # expert 0's down_proj declared [I, H] instead of [H, I]: the same bytes, the wrong shape
@@ -467,7 +468,7 @@ def test_glm_bf16_source(inspect_bin: str, tmp: str) -> None:
                       bf16_t[:2] + [(bf16_t[2][0], "BF16", [I, H], bf16_t[2][3])] + bf16_t[3:])
     run([conv, "--model", bad, "--out", os.path.join(tmp, "glm_bf16_bad_out"), "--mode", "uniform4",
          "--layers", "3", "3", "--trace", trace], expect_ok=False)
-    print("PASS GLM BF16 source: byte-identical to the FP8 source, wrong BF16 shape refused")
+    print("PASS GLM BF16 source: byte-identical to FP8 + Metal==CUDA SHA-256 verified, wrong BF16 shape refused")
 
 
 def find_shard_for_tensor(out_dir: str, ext: str, tensor_name: str) -> str:

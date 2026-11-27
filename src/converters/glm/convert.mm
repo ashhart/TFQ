@@ -26,7 +26,8 @@
 // ============================================================================
 // TFF-PrismWave v3 (2D-AffineCoset/half4) Production GPU Converter (Apple M5)
 //   - Generates deterministic 16KB pw_v3_tables.bin (exact fp16 LUTs & c64)
-//   - --mode heat543 / heat43 / heat443 : Converts FP8 MoE layers -> layer_XX.tffpw (version=3)
+//   - --mode heat543 / heat43 / heat443 / uniform4 / uniform3 : FP8 or BF16 MoE -> layer_XX.tffpw (version=3)
+//     (the routed experts' dtype is read from the checkpoint: F8_E4M3 with weight_scale_inv, or BF16)
 //   - --mode nonmoe : Converts big 8-bit/64 non-MoE + L07-44 shared -> nonmoe.tffpw ("TFPN", v3)
 // ============================================================================
 
@@ -113,9 +114,9 @@ static inline std::vector<uint16_t> build_grid(const uint32_t* lut_u32, int lut_
     return tfq_tables::build_grid(lut_u32, lut_size, N_sym, C_shift, G, KC);
 }
 
-// Fast mmap safetensors reader with cached open shards
+// Fast mmap safetensors reader with cached open shards (supports multi-shard index and single model.safetensors)
 struct ShardCache {
-    struct Meta { uint64_t off, len; int R, C; };
+    struct Meta { uint64_t off, len; std::string dtype; int R, C; };
     struct Entry {
         int fd = -1; uint8_t* ptr = nullptr; size_t len = 0; uint64_t data_base = 0;
         std::map<std::string, Meta> tensors;
@@ -127,21 +128,26 @@ struct ShardCache {
     void init(const std::string& dir) {
         model_dir = dir;
         std::ifstream f(dir + "/model.safetensors.index.json");
-        std::string txt((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-        size_t pos = txt.find("\"weight_map\"");
-        if (pos == std::string::npos) { fprintf(stderr, "No weight_map in %s\n", dir.c_str()); exit(1); }
-        pos = txt.find('{', pos);
-        size_t end = txt.find('}', pos);
-        std::string body = txt.substr(pos + 1, end - pos - 1);
-        size_t i = 0;
-        while (i < body.size()) {
-            size_t q1 = body.find('"', i); if (q1 == std::string::npos) break;
-            size_t q2 = body.find('"', q1 + 1);
-            size_t q3 = body.find('"', q2 + 1);
-            size_t q4 = body.find('"', q3 + 1);
-            weight_map[body.substr(q1 + 1, q2 - q1 - 1)] = body.substr(q3 + 1, q4 - q3 - 1);
-            i = q4 + 1;
+        if (f.good()) {
+            std::string txt((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+            size_t pos = txt.find("\"weight_map\"");
+            if (pos == std::string::npos) { fprintf(stderr, "No weight_map in %s\n", dir.c_str()); exit(1); }
+            pos = txt.find('{', pos);
+            size_t end = txt.find('}', pos);
+            std::string body = txt.substr(pos + 1, end - pos - 1);
+            size_t i = 0;
+            while (i < body.size()) {
+                size_t q1 = body.find('"', i); if (q1 == std::string::npos) break;
+                size_t q2 = body.find('"', q1 + 1);
+                size_t q3 = body.find('"', q2 + 1);
+                size_t q4 = body.find('"', q3 + 1);
+                weight_map[body.substr(q1 + 1, q2 - q1 - 1)] = body.substr(q3 + 1, q4 - q3 - 1);
+                i = q4 + 1;
+            }
+            return;
         }
+        Entry& e = get_shard("model.safetensors");
+        for (const auto& kv : e.tensors) weight_map[kv.first] = "model.safetensors";
     }
 
     bool has_tensor(const std::string& name) const { return weight_map.count(name) > 0; }
@@ -172,6 +178,12 @@ struct ShardCache {
             size_t lb = hdr.find('[', dk), cm = hdr.find(',', lb), rb = hdr.find(']', cm);
             uint64_t o0 = std::stoull(hdr.substr(lb + 1, cm - lb - 1));
             uint64_t o1 = std::stoull(hdr.substr(cm + 1, rb - cm - 1));
+            std::string dtype;
+            size_t dp = obj.find("\"dtype\"");
+            if (dp != std::string::npos) {
+                size_t d1 = obj.find('"', obj.find(':', dp) + 1), d2 = obj.find('"', d1 + 1);
+                dtype = obj.substr(d1 + 1, d2 - d1 - 1);
+            }
             int R = 0, C = 0;
             size_t sp = obj.find("\"shape\"");
             if (sp != std::string::npos) {
@@ -180,19 +192,20 @@ struct ShardCache {
                 size_t scm = sbody.find(',');
                 if (scm != std::string::npos) { R = std::stoi(sbody.substr(0, scm)); C = std::stoi(sbody.substr(scm + 1)); }
             }
-            e.tensors[tname] = {o0, o1 - o0, R, C};
+            e.tensors[tname] = {o0, o1 - o0, dtype, R, C};
             p = close_brace + 1;
         }
         shards[fn] = std::move(e);
         return shards[fn];
     }
 
-    const uint8_t* get_tensor(const std::string& name, size_t* out_len = nullptr, int* out_R = nullptr, int* out_C = nullptr) {
+    const uint8_t* get_tensor(const std::string& name, std::string* out_dtype = nullptr, size_t* out_len = nullptr, int* out_R = nullptr, int* out_C = nullptr) {
         auto it = weight_map.find(name);
         if (it == weight_map.end()) { fprintf(stderr, "Missing tensor %s\n", name.c_str()); exit(1); }
         Entry& sh = get_shard(it->second);
         auto tit = sh.tensors.find(name);
         if (tit == sh.tensors.end()) { fprintf(stderr, "Missing %s in %s\n", name.c_str(), it->second.c_str()); exit(1); }
+        if (out_dtype) *out_dtype = tit->second.dtype;
         if (out_len) *out_len = tit->second.len;
         if (out_R) *out_R = tit->second.R;
         if (out_C) *out_C = tit->second.C;
@@ -314,6 +327,7 @@ int main(int argc, char** argv) {
         };
 
         auto pso_fp8_row  = get_pso("fp8_dequant_row_fwht");
+        auto pso_bf16_row = get_pso("bf16_row_fwht");
         auto pso_q8_row   = get_pso("q8_64_dequant_row_fwht");
         auto pso_col_fwht = get_pso("col_fwht_and_ss");
         auto pso_pack_nax = get_pso("finalize_scales_and_pack_nax");
@@ -569,11 +583,12 @@ int main(int argc, char** argv) {
             if (cache.has_tensor(probe)) layer_prefix = "model.layers";
         }
         int H = 4096, I = 2048, N_EXP = 0;
+        std::string src_dtype;
         {
             char probe[256];
             snprintf(probe, sizeof(probe), "%s.%d.mlp.experts.0.gate_proj.weight", layer_prefix.c_str(), l_start);
             size_t dummy = 0;
-            cache.get_tensor(probe, &dummy, &I, &H);
+            cache.get_tensor(probe, &src_dtype, &dummy, &I, &H);
             while (true) {
                 snprintf(probe, sizeof(probe), "%s.%d.mlp.experts.%d.gate_proj.weight", layer_prefix.c_str(), l_start, N_EXP);
                 if (!cache.has_tensor(probe)) break;
@@ -581,12 +596,18 @@ int main(int argc, char** argv) {
             }
             cache.evict_all();
         }
+        const bool src_bf16 = (src_dtype == "BF16");
+        if (!src_bf16 && src_dtype != "F8_E4M3") {
+            fprintf(stderr, "Unsupported routed expert dtype %s (want F8_E4M3 or BF16)\n", src_dtype.c_str());
+            return 1;
+        }
         const uint32_t N_SC = (uint32_t)((H / 128) * (I / 128));
         const size_t MAX_ELEMS = (size_t)H * (size_t)I;
         const int BATCH_STREAMS = (H > 4096) ? 2048 : 4096;
         const size_t MAX_PACK_BYTES = (size_t)(I / 16) * (size_t)(H / 128) * 10ULL * 32ULL * 4ULL;
-        id<MTLBuffer> buf_fp8_in   = [dev newBufferWithLength:MAX_ELEMS options:MTLResourceStorageModeShared];
-        id<MTLBuffer> buf_sc_inv   = [dev newBufferWithLength:(size_t)N_SC * 4ULL options:MTLResourceStorageModeShared];
+        id<MTLBuffer> buf_fp8_in   = src_bf16 ? nil : [dev newBufferWithLength:MAX_ELEMS options:MTLResourceStorageModeShared];
+        id<MTLBuffer> buf_sc_inv   = src_bf16 ? nil : [dev newBufferWithLength:(size_t)N_SC * 4ULL options:MTLResourceStorageModeShared];
+        id<MTLBuffer> buf_bf16_in  = src_bf16 ? [dev newBufferWithLength:MAX_ELEMS * 2ULL options:MTLResourceStorageModeShared] : nil;
         id<MTLBuffer> buf_w_tmp    = [dev newBufferWithLength:MAX_ELEMS * 4ULL options:MTLResourceStorageModePrivate];
         id<MTLBuffer> buf_w_rot    = [dev newBufferWithLength:MAX_ELEMS * 4ULL options:MTLResourceStorageModePrivate];
         id<MTLBuffer> buf_blk_ss   = [dev newBufferWithLength:(size_t)N_SC * 128ULL * 4ULL options:MTLResourceStorageModeShared];
@@ -602,8 +623,8 @@ int main(int argc, char** argv) {
         const int proj_C[3] = {H, H, I};
 
         printf("============================================================================================================\n");
-        printf("TFF-PrismWave v3 MOE CONVERTER | mode=%s | layers=%d..%d | H=%d I=%d E=%d prefix=%s | out=%s\n",
-               mode.c_str(), l_start, l_end, H, I, N_EXP, layer_prefix.c_str(), out_dir.c_str());
+        printf("TFF-PrismWave v3 MOE CONVERTER | mode=%s | layers=%d..%d | H=%d I=%d E=%d prefix=%s src=%s | out=%s\n",
+               mode.c_str(), l_start, l_end, H, I, N_EXP, layer_prefix.c_str(), src_dtype.c_str(), out_dir.c_str());
         printf("============================================================================================================\n");
         fflush(stdout);
 
@@ -629,10 +650,14 @@ int main(int argc, char** argv) {
                 ranks = tfq_moe::rank_glm_experts_datafree(cache, lyr, N_EXP, H, &used_router, layer_prefix.c_str());
             }
             if (lyr == l_start) {
+                const char* datafree = src_bf16
+                    ? (used_router ? "DATA-FREE router sensitivity (BF16 source: no weight_scale_inv for the weight term)"
+                                   : "none (BF16 source without a router: index order)")
+                    : (used_router ? "DATA-FREE router+weight sensitivity (no calibration data)"
+                                   : "DATA-FREE expert weight-scale sensitivity (no calibration data)");
                 printf("HeatAlloc: %s\n", used_trace
                     ? ("TRACE-GUIDED (uses calibration routing counts from " + trace_path + ")").c_str()
-                    : (used_router ? "DATA-FREE router+weight sensitivity (no calibration data)"
-                                   : "DATA-FREE expert weight-scale sensitivity (no calibration data)"));
+                    : datafree);
                 fflush(stdout);
             }
 
@@ -670,13 +695,25 @@ int main(int argc, char** argv) {
                     int R = proj_R[p], C = proj_C[p];
                     char base[256];
                     snprintf(base, sizeof(base), "%s.%d.mlp.experts.%d.%s", layer_prefix.c_str(), lyr, e, proj_names[p]);
-                    size_t nw = 0, ns = 0;
-                    const uint8_t* w_ptr = cache.get_tensor(std::string(base) + ".weight", &nw);
-                    const uint8_t* s_ptr = cache.get_tensor(std::string(base) + ".weight_scale_inv", &ns);
-                    tfq_common::check_finite_fp8_e4m3(w_ptr, (uint32_t)R, (uint32_t)C, std::string(base) + ".weight");
-                    tfq_common::check_finite_f32((const float*)s_ptr, (uint32_t)(R / 128), (uint32_t)(C / 128), std::string(base) + ".weight_scale_inv");
-                    memcpy([buf_fp8_in contents], w_ptr, nw);
-                    memcpy([buf_sc_inv contents], s_ptr, ns);
+                    if (src_bf16) {
+                        std::string dtype; size_t nw = 0; int tR = 0, tC = 0;
+                        const uint8_t* w_ptr = cache.get_tensor(std::string(base) + ".weight", &dtype, &nw, &tR, &tC);
+                        if (dtype != "BF16" || tR != R || tC != C || nw != (size_t)R * (size_t)C * 2u) {
+                            fprintf(stderr, "Unexpected %s.weight: dtype %s shape [%d, %d] bytes %zu (want BF16 [%d, %d])\n",
+                                base, dtype.c_str(), tR, tC, nw, R, C);
+                            return 1;
+                        }
+                        tfq_common::check_finite_bf16(reinterpret_cast<const uint16_t*>(w_ptr), (uint32_t)R, (uint32_t)C, std::string(base) + ".weight");
+                        memcpy([buf_bf16_in contents], w_ptr, nw);
+                    } else {
+                        size_t nw = 0, ns = 0;
+                        const uint8_t* w_ptr = cache.get_tensor(std::string(base) + ".weight", nullptr, &nw);
+                        const uint8_t* s_ptr = cache.get_tensor(std::string(base) + ".weight_scale_inv", nullptr, &ns);
+                        tfq_common::check_finite_fp8_e4m3(w_ptr, (uint32_t)R, (uint32_t)C, std::string(base) + ".weight");
+                        tfq_common::check_finite_f32((const float*)s_ptr, (uint32_t)(R / 128), (uint32_t)(C / 128), std::string(base) + ".weight_scale_inv");
+                        memcpy([buf_fp8_in contents], w_ptr, nw);
+                        memcpy([buf_sc_inv contents], s_ptr, ns);
+                    }
 
                     MatParams mp = {(uint32_t)R, (uint32_t)C, b, 1.0f, 0u, 0u};
                     int total_streams = (R / 16) * 32;
@@ -686,11 +723,18 @@ int main(int argc, char** argv) {
                     id<MTLCommandBuffer> cb = [q commandBuffer];
                     id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
 
-                    [enc setComputePipelineState:pso_fp8_row];
-                    [enc setBuffer:buf_fp8_in offset:0 atIndex:0]; [enc setBuffer:buf_sc_inv offset:0 atIndex:1];
-                    [enc setBuffer:buf_fp8_lut offset:0 atIndex:2]; [enc setBuffer:buf_w_tmp offset:0 atIndex:3];
-                    [enc setBytes:&mp length:sizeof(mp) atIndex:4];
-                    [enc dispatchThreadgroups:MTLSizeMake(C / 128, R, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+                    if (src_bf16) {
+                        [enc setComputePipelineState:pso_bf16_row];
+                        [enc setBuffer:buf_bf16_in offset:0 atIndex:0]; [enc setBuffer:buf_w_tmp offset:0 atIndex:1];
+                        [enc setBytes:&mp length:sizeof(mp) atIndex:2];
+                        [enc dispatchThreadgroups:MTLSizeMake(C / 128, R, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+                    } else {
+                        [enc setComputePipelineState:pso_fp8_row];
+                        [enc setBuffer:buf_fp8_in offset:0 atIndex:0]; [enc setBuffer:buf_sc_inv offset:0 atIndex:1];
+                        [enc setBuffer:buf_fp8_lut offset:0 atIndex:2]; [enc setBuffer:buf_w_tmp offset:0 atIndex:3];
+                        [enc setBytes:&mp length:sizeof(mp) atIndex:4];
+                        [enc dispatchThreadgroups:MTLSizeMake(C / 128, R, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+                    }
 
                     [enc setComputePipelineState:pso_col_fwht];
                     [enc setBuffer:buf_w_tmp offset:0 atIndex:0]; [enc setBuffer:buf_w_rot offset:0 atIndex:1];
@@ -733,7 +777,7 @@ int main(int argc, char** argv) {
                         s_sig += (double)se[si_s * 2 + 0];
                         s_err += (double)se[si_s * 2 + 1];
                     }
-                    float snr = (float)(10.0 * log10(s_sig / std::max(1e-18, s_err)));
+                    float snr = (float)(10.0 * log10(s_sig / std::max(1e-12, s_err)));
                     if (snr < 10.0f || std::isnan(snr)) {
                         fprintf(stderr, "FATAL: Bad SNR %.3f on L%d E%d %s!\n", snr, lyr, e, proj_names[p]);
                         return 2;
@@ -762,7 +806,7 @@ int main(int argc, char** argv) {
             hdr.reserved1[1] = tfq_xxh64::hash(all_scales.data(), all_scales.size() * 2ULL);
             hdr.reserved1[2] = tfq_xxh64::hash(all_weights.data(), all_weights.size() * 4ULL);
             hdr.reserved1[3] = 0ULL;
-            snprintf((char*)hdr.meta_tag, 32, "v3_%s", mode.c_str());
+            strncpy((char*)hdr.meta_tag, mode.c_str(), 31);
 
             std::string tmp_path = std::string(out_path) + ".tmp";
             auto write_all = [&](FILE* f, const void* p, size_t n) {
