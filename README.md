@@ -46,6 +46,8 @@ tfq3 /path/to/Qwen2.5-1.5B --bits 2 --quantize-embed   # 2.001 bpw TFQ4-E8P -> 0
 
 # GLM-5.3-Flash: compact (3.39 bpw avg + 4b non-MoE) OR matched uniform-4b + full-precision non-MoE
 tfq3 /path/to/GLM-5.3-Flash-FP8 --glm-mode uniform4 --keep-nonmoe-bf16
+# ...or the routed experts from the BF16 checkpoint (CUDA; non-MoE stays in the source)
+tfq3 zai-org/GLM-5.3-Flash-BF16 --glm-mode uniform4 --keep-nonmoe-bf16
 
 # ERNIE-5.5-Flash (CUDA): uniform 3b/4b/5b routed experts from the BF16 checkpoint; other tensors stay in the source
 tfq3 baidu/ERNIE-5.5-Flash-Preview-BF16 --profile 4b

@@ -1,6 +1,7 @@
 // ============================================================================
 // TensorFold TFQ3 (2D-AffineCoset/half4) GLM-5.3-Flash CUDA GPU Converter
-//   - --mode heat543|heat43|heat443|uniform4|uniform3 : FP8 MoE -> layer_XX.tffpw ("TFPW" v3)
+//   - --mode heat543|heat43|heat443|uniform4|uniform3 : FP8 or BF16 MoE -> layer_XX.tffpw ("TFPW" v3)
+//     (the routed experts' dtype is read from the checkpoint: F8_E4M3 with weight_scale_inv, or BF16)
 //   - --mode nonmoe : 8-bit/64 non-MoE + shared + lm_head -> nonmoe.tffpw ("TFPN" v3)
 // ============================================================================
 #include "../cuda_encode_common.cuh"
@@ -239,11 +240,12 @@ int main(int argc, char** argv) {
         if (cache.has_tensor(probe)) layer_prefix = "model.layers";
     }
     int H = 4096, I = 2048, N_EXP = 0;
+    std::string src_dtype;
     {
         char probe[256];
         snprintf(probe, sizeof(probe), "%s.%d.mlp.experts.0.gate_proj.weight", layer_prefix.c_str(), l_start);
         size_t dummy = 0;
-        cache.get_tensor(probe, nullptr, &dummy, &I, &H);
+        cache.get_tensor(probe, &src_dtype, &dummy, &I, &H);
         while (true) {
             snprintf(probe, sizeof(probe), "%s.%d.mlp.experts.%d.gate_proj.weight", layer_prefix.c_str(), l_start, N_EXP);
             if (!cache.has_tensor(probe)) break;
@@ -251,12 +253,21 @@ int main(int argc, char** argv) {
         }
         cache.evict_all();
     }
+    const bool src_bf16 = (src_dtype == "BF16");
+    if (!src_bf16 && src_dtype != "F8_E4M3") {
+        fprintf(stderr, "Unsupported routed expert dtype %s (want F8_E4M3 or BF16)\n", src_dtype.c_str());
+        return 1;
+    }
     const uint32_t N_SC = (uint32_t)((H / 128) * (I / 128));
     const size_t MAX_E = (size_t)H * (size_t)I;
-    uint8_t *d_fp8; float *d_scinv, *d_tmp, *d_rot, *d_ss, *d_str, *d_se;
+    uint8_t *d_fp8 = nullptr; uint16_t *d_bf16 = nullptr; float *d_scinv = nullptr, *d_tmp, *d_rot, *d_ss, *d_str, *d_se;
     __half *d_sc; uint32_t *d_hist, *d_pack;
-    TFQ_CUDA_CHECK(cudaMalloc(&d_fp8, MAX_E));
-    TFQ_CUDA_CHECK(cudaMalloc(&d_scinv, (size_t)N_SC * 4ULL));
+    if (src_bf16) {
+        TFQ_CUDA_CHECK(cudaMalloc(&d_bf16, MAX_E * 2ULL));
+    } else {
+        TFQ_CUDA_CHECK(cudaMalloc(&d_fp8, MAX_E));
+        TFQ_CUDA_CHECK(cudaMalloc(&d_scinv, (size_t)N_SC * 4ULL));
+    }
     TFQ_CUDA_CHECK(cudaMalloc(&d_tmp, MAX_E * 4ULL));
     TFQ_CUDA_CHECK(cudaMalloc(&d_rot, MAX_E * 4ULL));
     TFQ_CUDA_CHECK(cudaMalloc(&d_ss,  (size_t)N_SC * 128ULL * 4ULL));
@@ -283,12 +294,17 @@ int main(int argc, char** argv) {
             ranks = tfq_moe::rank_glm_experts_datafree(cache, lyr, N_EXP, H, &used_router, layer_prefix.c_str());
         }
         if (lyr == l_start) {
-            printf("GLM MoE CUDA | H=%d I=%d E=%d prefix=%s | HeatAlloc: %s\n",
-                H, I, N_EXP, layer_prefix.c_str(),
+            // A BF16 checkpoint has no weight_scale_inv, so its data-free rank has no weight term.
+            const char* datafree = src_bf16
+                ? (used_router ? "DATA-FREE router sensitivity (BF16 source: no weight_scale_inv for the weight term)"
+                               : "none (BF16 source without a router: index order)")
+                : (used_router ? "DATA-FREE router+weight sensitivity (no calibration data)"
+                               : "DATA-FREE expert weight-scale sensitivity (no calibration data)");
+            printf("GLM MoE CUDA | H=%d I=%d E=%d prefix=%s src=%s | HeatAlloc: %s\n",
+                H, I, N_EXP, layer_prefix.c_str(), src_dtype.c_str(),
                 used_trace
                 ? ("TRACE-GUIDED (uses calibration routing counts from " + trace_path + ")").c_str()
-                : (used_router ? "DATA-FREE router+weight sensitivity (no calibration data)"
-                               : "DATA-FREE expert weight-scale sensitivity (no calibration data)"));
+                : datafree);
             fflush(stdout);
         }
         std::vector<PrismExpertMeta> metas(N_EXP);
@@ -322,15 +338,28 @@ int main(int argc, char** argv) {
             for (int p = 0; p < 3; ++p) {
                 uint32_t R = proj_R[p], C = proj_C[p];
                 char base[256]; snprintf(base, sizeof(base), "%s.%d.mlp.experts.%d.%s", layer_prefix.c_str(), lyr, e, proj_names[p]);
-                size_t nw = 0, ns = 0;
-                const uint8_t* wp = cache.get_tensor(std::string(base) + ".weight", nullptr, &nw);
-                const uint8_t* sp = cache.get_tensor(std::string(base) + ".weight_scale_inv", nullptr, &ns);
-                tfq_common::check_finite_fp8_e4m3(wp, R, C, std::string(base) + ".weight");
-                tfq_common::check_finite_f32((const float*)sp, R / 128u, C / 128u, std::string(base) + ".weight_scale_inv");
-                TFQ_CUDA_CHECK(cudaMemcpy(d_fp8, wp, nw, cudaMemcpyHostToDevice));
-                TFQ_CUDA_CHECK(cudaMemcpy(d_scinv, sp, ns, cudaMemcpyHostToDevice));
                 MatParams mp{R, C, b, 1.0f, 0u, 0u};
-                fp8_dequant_row_fwht_kernel<<<dim3(C / 128u, R, 1), 32>>>(d_fp8, d_scinv, d_fp8_lut, d_tmp, mp);
+                if (src_bf16) {
+                    std::string dtype; size_t nw = 0; int tR = 0, tC = 0;
+                    const uint8_t* wp = cache.get_tensor(std::string(base) + ".weight", &dtype, &nw, &tR, &tC);
+                    if (dtype != "BF16" || (uint32_t)tR != R || (uint32_t)tC != C || nw != (size_t)R * C * 2u) {
+                        fprintf(stderr, "Unexpected %s.weight: dtype %s shape [%d, %d] bytes %zu (want BF16 [%u, %u])\n",
+                            base, dtype.c_str(), tR, tC, nw, R, C);
+                        return 1;
+                    }
+                    tfq_common::check_finite_bf16(reinterpret_cast<const uint16_t*>(wp), R, C, std::string(base) + ".weight");
+                    TFQ_CUDA_CHECK(cudaMemcpy(d_bf16, wp, nw, cudaMemcpyHostToDevice));
+                    bf16_row_fwht_kernel<<<dim3(C / 128u, R, 1), 32>>>(d_bf16, d_tmp, mp);
+                } else {
+                    size_t nw = 0, ns = 0;
+                    const uint8_t* wp = cache.get_tensor(std::string(base) + ".weight", nullptr, &nw);
+                    const uint8_t* sp = cache.get_tensor(std::string(base) + ".weight_scale_inv", nullptr, &ns);
+                    tfq_common::check_finite_fp8_e4m3(wp, R, C, std::string(base) + ".weight");
+                    tfq_common::check_finite_f32((const float*)sp, R / 128u, C / 128u, std::string(base) + ".weight_scale_inv");
+                    TFQ_CUDA_CHECK(cudaMemcpy(d_fp8, wp, nw, cudaMemcpyHostToDevice));
+                    TFQ_CUDA_CHECK(cudaMemcpy(d_scinv, sp, ns, cudaMemcpyHostToDevice));
+                    fp8_dequant_row_fwht_kernel<<<dim3(C / 128u, R, 1), 32>>>(d_fp8, d_scinv, d_fp8_lut, d_tmp, mp);
+                }
                 col_fwht_and_ss_kernel<<<dim3(C, R / 128u, 1), 32>>>(d_tmp, d_rot, d_ss, mp);
                 finalize_scales_and_pack_nax_kernel<<<dim3(R / 16u, C / 128u, 1), 32>>>(d_rot, d_ss, d_sc, d_str, mp);
                 uint32_t n_str = (R / 16u) * 32u;
