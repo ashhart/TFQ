@@ -481,6 +481,16 @@ static inline ConversionPlan build_plan(const SafetensorsDir& st, const GenericO
     }
 
     // Compute data-free priority score for each job (role + boundary layers + excess kurtosis).
+    //
+    // Why role + boundary + kurtosis instead of greedy weight-error-per-byte (see issue #25):
+    //   After 2D FWHT-128, per-tier relative weight error is nearly constant across tensors
+    //   (3b ~0.0185, 4b ~0.0046, 5b ~0.0012, <10% spread). On Qwen2.5-1.5B at matched byte
+    //   budgets (3.07 / 3.25 / 3.50 bpw), greedy weight-SSE-per-byte cuts weight SSE by 4.7-7.1%
+    //   but spends budget on large MLPs and degrades WikiText-2 PPL/KL; RMSNorm-gamma-weighted
+    //   SSE narrows only part of the gap, and relative-error-per-byte over-upgrades small tensors
+    //   to 5b and also loses. Prioritizing attention + boundary layers outperforms all three
+    //   data-free weight-error objectives; activation-calibrated output-error scoring
+    //   tr(dW H dW^T) is a separate concern requiring calibration data.
     const int n_layers = plan.max_layer + 1;
     for (auto& j : plan.jobs) {
         double base = 50.0;
