@@ -36,6 +36,11 @@ static void fwht128_f64(double* x) {
 static std::vector<double> ref_dequant_e8p(
     const uint32_t* W, const uint16_t* sc, const tfq4::PwV4E8Tables& T, uint32_t N, uint32_t K
 ) {
+    const bool is_true = (T.table_kind == tfq4::PWV4_TABLE_TRUE_E8P);
+    uint8_t m_par[256] = {};
+    if (is_true) {
+        for (uint32_t k = 0; k < 256u; ++k) m_par[k] = tfq4::true_e8p_abs_parity(T.e8p_lut[k]);
+    }
     uint32_t n_bc = K / 128u, wpr = K / 16u;
     std::vector<double> Wrot((size_t)N * K, 0.0);
     for (uint32_t r = 0; r < N; ++r) {
@@ -47,11 +52,24 @@ static std::vector<double> ref_dequant_e8p(
             uint32_t c0 = packed & 0xFFFFu, c1 = packed >> 16;
             for (int half_idx = 0; half_idx < 2; ++half_idx) {
                 uint32_t code = half_idx ? c1 : c0;
-                uint32_t idx = code & 255u, sm = code >> 8;
-                for (int d = 0; d < 8; ++d) {
-                    double mag = (double)tfq4::f16_bits_to_f32(T.e8p_lut[idx][d]);
-                    double sgn = ((sm >> d) & 1u) ? -1.0 : 1.0;
-                    Wrot[(size_t)r * K + w * 16u + half_idx * 8u + d] = mag * sgn * fsc;
+                uint32_t idx = code & 255u;
+                if (is_true) {
+                    uint32_t s7 = (code >> 8) & 0x7Fu;
+                    uint32_t sm = s7 | (((static_cast<uint32_t>(__builtin_popcount(s7)) ^ m_par[idx]) & 1u) << 7);
+                    double c_sgn = (code & 0x8000u) ? -1.0 : 1.0;
+                    for (int d = 0; d < 8; ++d) {
+                        double mag = (double)tfq4::f16_bits_to_f32(T.e8p_lut[idx][d]);
+                        double sgn = ((sm >> d) & 1u) ? -1.0 : 1.0;
+                        double q = c_sgn * (mag * sgn - 0.25);
+                        Wrot[(size_t)r * K + w * 16u + half_idx * 8u + d] = q * fsc;
+                    }
+                } else {
+                    uint32_t sm = code >> 8;
+                    for (int d = 0; d < 8; ++d) {
+                        double mag = (double)tfq4::f16_bits_to_f32(T.e8p_lut[idx][d]);
+                        double sgn = ((sm >> d) & 1u) ? -1.0 : 1.0;
+                        Wrot[(size_t)r * K + w * 16u + half_idx * 8u + d] = mag * sgn * fsc;
+                    }
                 }
             }
         }
@@ -100,6 +118,11 @@ int main(int argc, char** argv) {
         };
         id<MTLComputePipelineState> pso_fx = mk("tfq4_fwht_x");
         id<MTLComputePipelineState> pso_e8 = mk("tfq4_e8p_dense");
+        id<MTLComputePipelineState> pso_e8_true = mk("tfq4_true_e8p_dense");
+        if (!pso_fx || !pso_e8 || !pso_e8_true) {
+            fprintf(stderr, "Failed to create Metal compute pipelines: %s\n", err ? [[err localizedDescription] UTF8String] : "unknown");
+            return 1;
+        }
         id<MTLCommandQueue> q = [dev newCommandQueue];
 
         if (!vec_path.empty()) {
@@ -111,6 +134,12 @@ int main(int argc, char** argv) {
             }
             tfq4::PwV4E8Tables vtbl{};
             if (fread(&vtbl, 1, sizeof(vtbl), vf) != sizeof(vtbl)) { fprintf(stderr, "Truncated VEC4 tables\n"); fclose(vf); return 1; }
+            if (vtbl.magic != tfq4::MAGIC_PWV4 || vtbl.version != tfq4::FORMAT_VER || vtbl.table_kind > tfq4::PWV4_TABLE_MAX_KNOWN) {
+                fprintf(stderr, "Unsupported PWV4 table in VEC4 bundle: magic=0x%08x ver=%u table_kind=%u\n",
+                        vtbl.magic, vtbl.version, vtbl.table_kind);
+                fclose(vf); return 1;
+            }
+            id<MTLComputePipelineState> pso_vec = (vtbl.table_kind == tfq4::PWV4_TABLE_TRUE_E8P) ? pso_e8_true : pso_e8;
             id<MTLBuffer> blut = [dev newBufferWithBytes:vtbl.e8p_lut length:sizeof(vtbl.e8p_lut) options:MTLResourceStorageModeShared];
             for (uint32_t ci = 0; ci < hdr[1]; ++ci) {
                 uint32_t ch[10] = {};
@@ -148,7 +177,7 @@ int main(int argc, char** argv) {
                 [enc setBuffer:bX offset:0 atIndex:0]; [enc setBuffer:bXr offset:0 atIndex:1];
                 [enc setBytes:&p length:sizeof(p) atIndex:2];
                 [enc dispatchThreadgroups:MTLSizeMake(k_loc / 128u, rows, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
-                [enc setComputePipelineState:pso_e8];
+                [enc setComputePipelineState:pso_vec];
                 [enc setBuffer:bW offset:0 atIndex:0]; [enc setBuffer:bS offset:0 atIndex:1];
                 [enc setBuffer:blut offset:0 atIndex:2]; [enc setBuffer:bXr offset:0 atIndex:3];
                 [enc setBuffer:bY offset:0 atIndex:4]; [enc setBytes:&p length:sizeof(p) atIndex:5];
@@ -161,78 +190,112 @@ int main(int argc, char** argv) {
                 }
                 double cos_v = dot / (std::sqrt(na * nb) + 1e-30);
                 if (cos_v < 0.99998) {
-                    fprintf(stderr, "FAIL Metal VEC4 case=%u r_off=%u c_off=%u cos=%.8f\n", ci, r_off, c_off, cos_v);
+                    fprintf(stderr, "FAIL Metal VEC4 table_kind=%u case=%u r_off=%u c_off=%u cos=%.8f\n",
+                            vtbl.table_kind, ci, r_off, c_off, cos_v);
                     fclose(vf); return 1;
                 }
             }
             fclose(vf);
-            printf("PASS Metal TFQ4 golden vectors (%u cases, including r_off & c_off offsets)\n", hdr[1]);
+            printf("PASS Metal TFQ4 golden vectors (table_kind=%u, %u cases, including r_off & c_off offsets)\n",
+                   vtbl.table_kind, hdr[1]);
             return 0;
         }
 
-        tfq4::PwV4E8Tables h_tbl;
-        tfq4::build_e8p_tables(h_tbl);
-        id<MTLBuffer> b_lut = [dev newBufferWithBytes:h_tbl.e8p_lut length:sizeof(h_tbl.e8p_lut) options:MTLResourceStorageModeShared];
+        tfq4::PwV4E8Tables h_tbl_trained{}, h_tbl_true{};
+        tfq4::build_e8p_tables(h_tbl_trained);
+        tfq4::build_true_e8p_tables(h_tbl_true);
+        id<MTLBuffer> b_lut_trained = [dev newBufferWithBytes:h_tbl_trained.e8p_lut length:sizeof(h_tbl_trained.e8p_lut) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> b_lut_true = [dev newBufferWithBytes:h_tbl_true.e8p_lut length:sizeof(h_tbl_true.e8p_lut) options:MTLResourceStorageModeShared];
 
-        // 1. Exact fp64 parity + bit-exact rows=1 == rows=16 check
-        const uint32_t N = 512u, K = 1024u;
+        // 1. Exact fp64 parity + bit-exact rows=1 == rows=16 (and rows=17) + fp16 saturation for BOTH table_kind=0 and table_kind=2
+        const uint32_t N = 512u, K = 1024u, MAX_R = 17u;
         std::mt19937 rng(777);
         std::vector<uint32_t> h_W((size_t)N * (K / 16u));
-        std::vector<uint16_t> h_sc((size_t)(N / 128u) * (K / 128u)), h_X(16u * K);
+        std::vector<uint16_t> h_sc((size_t)(N / 128u) * (K / 128u)), h_X((size_t)MAX_R * K);
         for (auto& w : h_W) w = rng();
         for (auto& s : h_sc) s = tfq4::f32_to_f16_bits(0.03f + 0.02f * ((float)(rng() & 255u) / 255.0f));
         for (auto& x : h_X) x = tfq4::f32_to_f16_bits(((int)(rng() % 201u) - 100) * 0.01f);
-        auto W_ref = ref_dequant_e8p(h_W.data(), h_sc.data(), h_tbl, N, K);
 
         id<MTLBuffer> b_W = [dev newBufferWithBytes:h_W.data() length:h_W.size() * 4 options:MTLResourceStorageModeShared];
         id<MTLBuffer> b_sc = [dev newBufferWithBytes:h_sc.data() length:h_sc.size() * 2 options:MTLResourceStorageModeShared];
         id<MTLBuffer> b_X = [dev newBufferWithBytes:h_X.data() length:h_X.size() * 2 options:MTLResourceStorageModeShared];
-        id<MTLBuffer> b_xr = [dev newBufferWithLength:16u * K * 2 options:MTLResourceStorageModeShared];
-        id<MTLBuffer> b_Y = [dev newBufferWithLength:16u * N * 4 options:MTLResourceStorageModeShared];
+        id<MTLBuffer> b_xr = [dev newBufferWithLength:(size_t)MAX_R * K * 2 options:MTLResourceStorageModeShared];
+        id<MTLBuffer> b_Y = [dev newBufferWithLength:(size_t)MAX_R * N * 4 options:MTLResourceStorageModeShared];
 
-        auto run = [&](uint32_t rows, std::vector<float>& out) {
-            MetalTfq4Params p{rows, N, K, K, N, 0, 0};
-            id<MTLCommandBuffer> cb = [q commandBuffer];
-            id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
-            [enc setComputePipelineState:pso_fx];
-            [enc setBuffer:b_X offset:0 atIndex:0]; [enc setBuffer:b_xr offset:0 atIndex:1];
-            [enc setBytes:&p length:sizeof(p) atIndex:2];
-            [enc dispatchThreadgroups:MTLSizeMake(K / 128u, rows, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
-            [enc setComputePipelineState:pso_e8];
-            [enc setBuffer:b_W offset:0 atIndex:0]; [enc setBuffer:b_sc offset:0 atIndex:1];
-            [enc setBuffer:b_lut offset:0 atIndex:2]; [enc setBuffer:b_xr offset:0 atIndex:3];
-            [enc setBuffer:b_Y offset:0 atIndex:4]; [enc setBytes:&p length:sizeof(p) atIndex:5];
-            [enc dispatchThreadgroups:MTLSizeMake(N / 128u, (rows + 15u) / 16u, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-            [enc endEncoding]; [cb commit]; [cb waitUntilCompleted];
-            out.resize((size_t)rows * N);
-            memcpy(out.data(), [b_Y contents], out.size() * 4);
+        struct KindCfg {
+            const char* name;
+            uint32_t kind;
+            const tfq4::PwV4E8Tables* tbl;
+            id<MTLBuffer> lut;
+            id<MTLComputePipelineState> pso;
+        };
+        KindCfg kinds[] = {
+            {"trained/kind=0",  tfq4::PWV4_TABLE_LEGACY_TRAINED, &h_tbl_trained, b_lut_trained, pso_e8},
+            {"true-E8P/kind=2", tfq4::PWV4_TABLE_TRUE_E8P,       &h_tbl_true,    b_lut_true,    pso_e8_true},
         };
 
-        std::vector<float> y1, y16;
-        run(1u, y1); run(16u, y16);
-        for (uint32_t r = 0; r < N; ++r) {
-            if (y1[r] != y16[r]) { fprintf(stderr, "FAIL TFQ4 Metal r1!=r16 @ %u (%.7f vs %.7f)\n", r, y1[r], y16[r]); return 1; }
-        }
-        double dot = 0.0, na = 0.0, nb = 0.0;
-        for (uint32_t m = 0; m < 16u; ++m) for (uint32_t r = 0; r < N; ++r) {
-            double ref = 0.0;
-            for (uint32_t c = 0; c < K; ++c) ref += W_ref[(size_t)r * K + c] * (double)tfq4::f16_bits_to_f32(h_X[(size_t)m * K + c]);
-            double g = y16[(size_t)m * N + r];
-            dot += g * ref; na += g * g; nb += ref * ref;
-        }
-        double cos_v = dot / (std::sqrt(na * nb) + 1e-30);
-        if (cos_v < 0.99999) { fprintf(stderr, "FAIL TFQ4 Metal fp64 parity cos=%.8f\n", cos_v); return 1; }
-        // Issue #11: Verify fp16 saturation prevents Inf/NaN when rotated activation exceeds 65504
-        {
-            std::vector<uint16_t> big_x(K, tfq4::f32_to_f16_bits(10000.0f));
-            memcpy([b_X contents], big_x.data(), K * 2);
-            std::vector<float> y_big;
-            run(1u, y_big);
-            for (float v : y_big) {
-                if (!std::isfinite(v)) { fprintf(stderr, "FAIL TFQ4 Metal fp16 overflow produced non-finite output\n"); return 1; }
+        for (auto& kc : kinds) {
+            memcpy([b_X contents], h_X.data(), h_X.size() * 2);
+            auto W_ref = ref_dequant_e8p(h_W.data(), h_sc.data(), *kc.tbl, N, K);
+
+            auto run = [&](uint32_t rows, std::vector<float>& out) {
+                MetalTfq4Params p{rows, N, K, K, N, 0, 0};
+                id<MTLCommandBuffer> cb = [q commandBuffer];
+                id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+                [enc setComputePipelineState:pso_fx];
+                [enc setBuffer:b_X offset:0 atIndex:0]; [enc setBuffer:b_xr offset:0 atIndex:1];
+                [enc setBytes:&p length:sizeof(p) atIndex:2];
+                [enc dispatchThreadgroups:MTLSizeMake(K / 128u, rows, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+                [enc setComputePipelineState:kc.pso];
+                [enc setBuffer:b_W offset:0 atIndex:0]; [enc setBuffer:b_sc offset:0 atIndex:1];
+                [enc setBuffer:kc.lut offset:0 atIndex:2]; [enc setBuffer:b_xr offset:0 atIndex:3];
+                [enc setBuffer:b_Y offset:0 atIndex:4]; [enc setBytes:&p length:sizeof(p) atIndex:5];
+                [enc dispatchThreadgroups:MTLSizeMake(N / 128u, (rows + 15u) / 16u, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                [enc endEncoding]; [cb commit]; [cb waitUntilCompleted];
+                out.resize((size_t)rows * N);
+                memcpy(out.data(), [b_Y contents], out.size() * 4);
+            };
+
+            std::vector<float> y1, y16, y17;
+            run(1u, y1); run(16u, y16); run(17u, y17);
+            for (uint32_t r = 0; r < N; ++r) {
+                if (y1[r] != y16[r]) {
+                    fprintf(stderr, "FAIL TFQ4 Metal (%s) r1!=r16 @ %u (%.7f vs %.7f)\n", kc.name, r, y1[r], y16[r]);
+                    return 1;
+                }
+                if (y1[r] != y17[r]) {
+                    fprintf(stderr, "FAIL TFQ4 Metal (%s) r1!=r17 @ %u (%.7f vs %.7f)\n", kc.name, r, y1[r], y17[r]);
+                    return 1;
+                }
             }
+            double dot = 0.0, na = 0.0, nb = 0.0;
+            for (uint32_t m = 0; m < MAX_R; ++m) for (uint32_t r = 0; r < N; ++r) {
+                double ref = 0.0;
+                for (uint32_t c = 0; c < K; ++c) ref += W_ref[(size_t)r * K + c] * (double)tfq4::f16_bits_to_f32(h_X[(size_t)m * K + c]);
+                double g = y17[(size_t)m * N + r];
+                dot += g * ref; na += g * g; nb += ref * ref;
+            }
+            double cos_v = dot / (std::sqrt(na * nb) + 1e-30);
+            if (cos_v < 0.99999) {
+                fprintf(stderr, "FAIL TFQ4 Metal (%s) fp64 parity cos=%.8f\n", kc.name, cos_v);
+                return 1;
+            }
+            // Issue #11: Verify fp16 saturation prevents Inf/NaN when rotated activation exceeds 65504
+            {
+                std::vector<uint16_t> big_x(K, tfq4::f32_to_f16_bits(10000.0f));
+                memcpy([b_X contents], big_x.data(), K * 2);
+                std::vector<float> y_big;
+                run(1u, y_big);
+                for (float v : y_big) {
+                    if (!std::isfinite(v)) {
+                        fprintf(stderr, "FAIL TFQ4 Metal (%s) fp16 overflow produced non-finite output\n", kc.name);
+                        return 1;
+                    }
+                }
+            }
+            printf("PASS tfq4_metal_test (%s: 2.0b %s fp64 parity cos=%.8f + bit-exact r1==r16==r17 + fp16 sat)\n",
+                   [[dev name] UTF8String], kc.name, cos_v);
         }
-        printf("PASS tfq4_metal_test (%s: 2.0b E8P fp64 parity cos=%.8f + bit-exact r1==r16 + fp16 sat)\n", [[dev name] UTF8String], cos_v);
 
         if (do_bench) {
             struct Shape { const char* name; uint32_t N, K; };
@@ -240,36 +303,38 @@ int main(int argc, char** argv) {
             id<MTLBuffer> bx = [dev newBufferWithLength:16ULL * 17408ULL * 2 options:MTLResourceStorageModeShared];
             id<MTLBuffer> bxr = [dev newBufferWithLength:16ULL * 17408ULL * 2 options:MTLResourceStorageModePrivate];
             id<MTLBuffer> by = [dev newBufferWithLength:16ULL * 34816ULL * 4 options:MTLResourceStorageModePrivate];
-            for (auto& s : shapes) {
-                size_t nw = (size_t)s.N * (s.K / 16u);
-                size_t ns = (size_t)(s.N / 128u) * (s.K / 128u);
-                id<MTLBuffer> bw = [dev newBufferWithLength:nw * 4 options:MTLResourceStorageModeShared];
-                id<MTLBuffer> bsc = [dev newBufferWithLength:ns * 2 options:MTLResourceStorageModeShared];
-                double bytes = (double)(nw * 4 + ns * 2);
-                for (uint32_t rows : {1u, 16u}) {
-                    MetalTfq4Params p{rows, s.N, s.K, s.K, s.N, 0, 0};
-                    auto run_n = [&](int reps) {
-                        id<MTLCommandBuffer> cb = [q commandBuffer];
-                        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
-                        for (int rep = 0; rep < reps; ++rep) {
-                            [enc setComputePipelineState:pso_fx];
-                            [enc setBuffer:bx offset:0 atIndex:0]; [enc setBuffer:bxr offset:0 atIndex:1];
-                            [enc setBytes:&p length:sizeof(p) atIndex:2];
-                            [enc dispatchThreadgroups:MTLSizeMake(s.K / 128u, rows, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
-                            [enc setComputePipelineState:pso_e8];
-                            [enc setBuffer:bw offset:0 atIndex:0]; [enc setBuffer:bsc offset:0 atIndex:1];
-                            [enc setBuffer:b_lut offset:0 atIndex:2]; [enc setBuffer:bxr offset:0 atIndex:3];
-                            [enc setBuffer:by offset:0 atIndex:4]; [enc setBytes:&p length:sizeof(p) atIndex:5];
-                            [enc dispatchThreadgroups:MTLSizeMake(s.N / 128u, (rows + 15u) / 16u, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-                        }
-                        [enc endEncoding]; [cb commit]; [cb waitUntilCompleted];
-                    };
-                    run_n(5);
-                    auto t0 = std::chrono::steady_clock::now();
-                    run_n(20);
-                    double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / 20.0;
-                    printf("  Metal TFQ4 %-10s [%5u x %5u] 2.0b rows=%2u | %5.1f MiB | %6.3f ms | %6.1f GB/s\n",
-                           s.name, s.N, s.K, rows, bytes / (1024.0 * 1024.0), ms, (bytes / 1e9) / (ms / 1e3));
+            for (auto& kc : kinds) {
+                for (auto& s : shapes) {
+                    size_t nw = (size_t)s.N * (s.K / 16u);
+                    size_t ns = (size_t)(s.N / 128u) * (s.K / 128u);
+                    id<MTLBuffer> bw = [dev newBufferWithLength:nw * 4 options:MTLResourceStorageModeShared];
+                    id<MTLBuffer> bsc = [dev newBufferWithLength:ns * 2 options:MTLResourceStorageModeShared];
+                    double bytes = (double)(nw * 4 + ns * 2);
+                    for (uint32_t rows : {1u, 16u}) {
+                        MetalTfq4Params p{rows, s.N, s.K, s.K, s.N, 0, 0};
+                        auto run_n = [&](int reps) {
+                            id<MTLCommandBuffer> cb = [q commandBuffer];
+                            id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+                            for (int rep = 0; rep < reps; ++rep) {
+                                [enc setComputePipelineState:pso_fx];
+                                [enc setBuffer:bx offset:0 atIndex:0]; [enc setBuffer:bxr offset:0 atIndex:1];
+                                [enc setBytes:&p length:sizeof(p) atIndex:2];
+                                [enc dispatchThreadgroups:MTLSizeMake(s.K / 128u, rows, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+                                [enc setComputePipelineState:kc.pso];
+                                [enc setBuffer:bw offset:0 atIndex:0]; [enc setBuffer:bsc offset:0 atIndex:1];
+                                [enc setBuffer:kc.lut offset:0 atIndex:2]; [enc setBuffer:bxr offset:0 atIndex:3];
+                                [enc setBuffer:by offset:0 atIndex:4]; [enc setBytes:&p length:sizeof(p) atIndex:5];
+                                [enc dispatchThreadgroups:MTLSizeMake(s.N / 128u, (rows + 15u) / 16u, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                            }
+                            [enc endEncoding]; [cb commit]; [cb waitUntilCompleted];
+                        };
+                        run_n(5);
+                        auto t0 = std::chrono::steady_clock::now();
+                        run_n(20);
+                        double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / 20.0;
+                        printf("  Metal TFQ4 %-15s %-10s [%5u x %5u] 2.0b rows=%2u | %5.1f MiB | %6.3f ms | %6.1f GB/s\n",
+                               kc.name, s.name, s.N, s.K, rows, bytes / (1024.0 * 1024.0), ms, (bytes / 1e9) / (ms / 1e3));
+                    }
                 }
             }
         }

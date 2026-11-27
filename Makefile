@@ -20,7 +20,7 @@ PREFIX    ?= $(HOME)/.local
 BINDIR    := $(PREFIX)/bin
 LIBDIR    := $(PREFIX)/lib/tfq3
 
-.PHONY: all metal cuda hip generic qwen27 flashnext glm inkling2 tfq4 tools test test-metal test-tfq4-metal test-cuda test-hip install uninstall clean
+.PHONY: all metal cuda hip generic qwen27 flashnext glm inkling2 tfq4 tools test test-metal test-tfq4-metal test-cuda test-tfq4-cuda test-hip install uninstall clean
 
 ifeq ($(UNAME_S),Darwin)
 all: tools metal
@@ -35,7 +35,7 @@ tools: $(BUILD)/tfq3-inspect $(BUILD)/tfq3-qwen27-package $(BUILD)/tfq3-train-ta
 
 metal: generic qwen27 flashnext glm inkling2 tfq4 $(BUILD)/tfq3-metal-test $(BUILD)/tfq3-metal-test.metallib $(BUILD)/tfq4-metal-test $(BUILD)/tfq4-metal-test.metallib
 
-cuda: tools $(BUILD)/tfq3-generic-convert-cuda $(BUILD)/tfq3-qwen27-convert-cuda $(BUILD)/tfq3-flashnext-convert-cuda $(BUILD)/tfq3-glm-convert-cuda $(BUILD)/tfq3-inkling2-convert-cuda $(BUILD)/tfq3-ernie-convert-cuda $(BUILD)/tfq4-convert-cuda $(BUILD)/tfq3-cuda-test
+cuda: tools $(BUILD)/tfq3-generic-convert-cuda $(BUILD)/tfq3-qwen27-convert-cuda $(BUILD)/tfq3-flashnext-convert-cuda $(BUILD)/tfq3-glm-convert-cuda $(BUILD)/tfq3-inkling2-convert-cuda $(BUILD)/tfq3-ernie-convert-cuda $(BUILD)/tfq4-convert-cuda $(BUILD)/tfq3-cuda-test $(BUILD)/tfq4-cuda-test
 
 generic: $(BUILD)/tfq3-generic-convert $(BUILD)/tfq3-generic-convert.metallib
 
@@ -151,6 +151,9 @@ $(BUILD)/tfq3-ernie-convert-cuda: src/converters/ernie/convert.cu src/converters
 $(BUILD)/tfq3-cuda-test: src/tools/tfq3_cuda_bench.cu src/kernels/cuda/tfq3_cuda.cuh | $(BUILD)
 	$(NVCC) $(NVCCFLAGS) $< -o $@
 
+$(BUILD)/tfq4-cuda-test: src/tools/tfq4_cuda_bench.cu src/kernels/cuda/tfq4_cuda.cuh src/converters/tfq4/tfq4_format.hpp | $(BUILD)
+	$(NVCC) $(NVCCFLAGS) $< -o $@
+
 $(BUILD)/tfq4-e8-bench: src/tools/tfq4_e8_bench.cu | $(BUILD)
 	$(NVCC) $(NVCCFLAGS) $< -o $@
 
@@ -172,6 +175,7 @@ test: all
 	@if [ "$(UNAME_S)" = "Darwin" ] && [ -x "$(BUILD)/tfq3-metal-test" ]; then $(BUILD)/tfq3-metal-test; fi
 	@if [ "$(UNAME_S)" = "Darwin" ] && [ -x "$(BUILD)/tfq4-metal-test" ]; then $(BUILD)/tfq4-metal-test; fi
 	@if [ "$(UNAME_S)" != "Darwin" ] && [ -x "$(BUILD)/tfq3-cuda-test" ]; then $(BUILD)/tfq3-cuda-test; fi
+	@if [ "$(UNAME_S)" != "Darwin" ] && [ -x "$(BUILD)/tfq4-cuda-test" ]; then $(BUILD)/tfq4-cuda-test; fi
 	@echo "All TFQ3 & TFQ4 targets built and verified in $(BUILD)/"
 
 test-metal: $(BUILD)/tfq3-metal-test $(BUILD)/tfq3-metal-test.metallib
@@ -182,6 +186,9 @@ test-tfq4-metal: $(BUILD)/tfq4-metal-test $(BUILD)/tfq4-metal-test.metallib
 
 test-cuda: cuda
 	@$(BUILD)/tfq3-cuda-test --bench
+
+test-tfq4-cuda: $(BUILD)/tfq4-cuda-test
+	@$(BUILD)/tfq4-cuda-test --bench
 
 install: all
 	@mkdir -p "$(BINDIR)" "$(LIBDIR)"
