@@ -22,16 +22,21 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-_REF_DIR = os.path.join(REPO_ROOT, "reference")
-if _REF_DIR not in sys.path:
-    sys.path.insert(0, _REF_DIR)
-
-import tfq3_reference as tfq3_ref
-import tfq4_lattice as tfq4_ref
+try:
+    from ..reference import tfq3_reference as tfq3_ref  # type: ignore
+    from ..reference import tfq4_lattice as tfq4_ref  # type: ignore
+except ImportError:
+    REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    _REF_DIR = os.path.join(REPO_ROOT, "reference")
+    if _REF_DIR not in sys.path:
+        sys.path.insert(0, _REF_DIR)
+    import tfq3_reference as tfq3_ref
+    import tfq4_lattice as tfq4_ref
 
 _CUDA_EXT = None
 _CUDA_EXT_TRIED = False
+_MPS_MOD = None
+_MPS_TRIED = False
 
 
 def _get_cuda_ext():
@@ -45,6 +50,22 @@ def _get_cuda_ext():
     except Exception:
         _CUDA_EXT = None
     return _CUDA_EXT
+
+
+def _get_mps_mod():
+    global _MPS_MOD, _MPS_TRIED
+    if _MPS_TRIED:
+        return _MPS_MOD
+    _MPS_TRIED = True
+    try:
+        try:
+            import tfq_mps  # type: ignore
+        except ImportError:
+            from . import tfq_mps  # type: ignore
+        _MPS_MOD = tfq_mps if tfq_mps.mps_kernels_available() else None
+    except Exception:
+        _MPS_MOD = None
+    return _MPS_MOD
 
 
 def _decode_tfpn_words_np(words_u32: np.ndarray, scales_f16: np.ndarray, pad_r: int, pad_c: int, bits: int, tbl: dict) -> np.ndarray:
@@ -116,6 +137,23 @@ class Tfq3Linear(nn.Module):
                 y = y + self.bias.to(dtype=y.dtype)
             return y.to(dtype=x.dtype)
 
+        if x.device.type == "mps":
+            mps = _get_mps_mod()
+            if mps is not None:
+                y = mps.tfq3_linear_mps(
+                    x,
+                    self.words_i32,
+                    self.scales_f16,
+                    self.tables_u8,
+                    self.bits,
+                    self.pad_r,
+                    self.pad_c,
+                    self.out_features,
+                )
+                if self.bias is not None:
+                    y = y + self.bias.to(device=y.device, dtype=y.dtype)
+                return y
+
         if self.cache_decoded and self._cached_w is not None and self._cached_w.device == x.device:
             w = self._cached_w
         else:
@@ -161,6 +199,7 @@ class Tfq4Linear(nn.Module):
 
         self.register_buffer("words_i32", torch.from_numpy(words_u32.view(np.int32).copy()))
         self.register_buffer("scales_f16", torch.from_numpy(scales_f16.astype(np.float16).copy()))
+        self.register_buffer("e8p_lut_f16", torch.from_numpy(e8p_lut.astype(np.float16).copy()))
         if bias is not None:
             self.register_buffer("bias", bias.detach().clone())
         else:
@@ -185,6 +224,43 @@ class Tfq4Linear(nn.Module):
         return torch.from_numpy(W_hat).to(device=self.words_i32.device, dtype=dtype)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.is_cuda:
+            ext = _get_cuda_ext()
+            if ext is not None and hasattr(ext, "tfq4_linear"):
+                y = ext.tfq4_linear(
+                    x.to(torch.bfloat16),
+                    self.words_i32,
+                    self.scales_f16,
+                    self.e8p_lut_f16,
+                    self.table_kind,
+                    self.pad_r,
+                    self.pad_c,
+                    self.out_features,
+                )
+                if self.bias is not None:
+                    y = y + self.bias.to(dtype=y.dtype)
+                return y.to(dtype=x.dtype)
+
+        if x.device.type == "mps":
+            mps = _get_mps_mod()
+            if mps is not None:
+                try:
+                    y = mps.tfq4_linear_mps(
+                        x,
+                        self.words_i32,
+                        self.scales_f16,
+                        self.e8p_lut_f16,
+                        self.table_kind,
+                        self.pad_r,
+                        self.pad_c,
+                        self.out_features,
+                    )
+                    if self.bias is not None:
+                        y = y + self.bias.to(device=y.device, dtype=y.dtype)
+                    return y
+                except RuntimeError:
+                    pass
+
         if self.cache_decoded and self._cached_w is not None and self._cached_w.device == x.device:
             w = self._cached_w
         else:

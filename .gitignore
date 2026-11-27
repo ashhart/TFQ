@@ -5,6 +5,8 @@ build/
 .DS_Store
 __pycache__/
 *.pyc
+*.egg-info/
+dist/
 *.tffpw
 pw_v3_tables.bin
 !reference/tables/pw_v3_tables.bin

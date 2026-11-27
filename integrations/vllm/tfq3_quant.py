@@ -27,11 +27,13 @@ import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-_REF_DIR = os.path.join(_REPO_ROOT, "reference")
-if _REF_DIR not in sys.path:
-    sys.path.insert(0, _REF_DIR)
-
-import tfq3_reference as tfq3_ref
+try:
+    from ..reference import tfq3_reference as tfq3_ref  # type: ignore
+except ImportError:
+    _REF_DIR = os.path.join(_REPO_ROOT, "reference")
+    if _REF_DIR not in sys.path:
+        sys.path.insert(0, _REF_DIR)
+    import tfq3_reference as tfq3_ref
 
 MAGIC_TFPN = 0x4E504654
 MAGIC_PWV3 = 0x33565750
@@ -82,6 +84,20 @@ def _get_cuda_ext():
     try:
         import tfq3_cuda_ext  # type: ignore
         return tfq3_cuda_ext
+    except Exception:
+        return None
+
+
+def _get_mps_mod():
+    try:
+        try:
+            from ..pytorch import tfq_mps  # type: ignore
+        except ImportError:
+            _pt_dir = os.path.join(_REPO_ROOT, "integrations", "pytorch")
+            if _pt_dir not in sys.path:
+                sys.path.insert(0, _pt_dir)
+            import tfq_mps  # type: ignore
+        return tfq_mps if tfq_mps.mps_kernels_available() else None
     except Exception:
         return None
 
@@ -421,6 +437,7 @@ class Tfq3LinearMethod(LinearMethodBase):
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         ext = _get_cuda_ext() if x.is_cuda else None
+        mps = _get_mps_mod() if (ext is None and x.device.type == "mps") else None
         n_parts = len(layer.tfq3_partition_bits)
         pad_c = layer.tfq3_pad_c
         n_bc_local = pad_c // 128
@@ -446,6 +463,21 @@ class Tfq3LinearMethod(LinearMethodBase):
             if ext is not None:
                 y_p = ext.tfq3_linear(
                     x.to(torch.bfloat16),
+                    w_p,
+                    s_p,
+                    layer.tfq3_tables,
+                    bits_p,
+                    pad_r_p,
+                    pad_c,
+                    orig_r_p,
+                    row_off_p,
+                    k_sign_off,
+                    bc0_buf,
+                    n_bc_buf,
+                )
+            elif mps is not None:
+                y_p = mps.tfq3_linear_mps(
+                    x,
                     w_p,
                     s_p,
                     layer.tfq3_tables,

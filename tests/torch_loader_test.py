@@ -189,10 +189,51 @@ def test_tfq4_table_kind_decode() -> None:
     print("PASS cpu: Tfq4Linear table_kind=0 and table_kind=2 decode == tfq4_lattice (and rejects kind=3)")
 
 
+def test_mps_fused_kernels() -> None:
+    """Zero-build Apple Silicon MPS fused Metal kernels for Tfq3Linear (3/4/5b) and Tfq4Linear (kind=0 & kind=2)."""
+    from tfq_mps import mps_kernels_available
+    if not mps_kernels_available():
+        print("SKIP mps: torch.mps.compile_shader unavailable")
+        return
+
+    rng = np.random.default_rng(19)
+    tbl_path = os.path.join(REPO_ROOT, "reference", "tables", "pw_v3_tables.bin")
+    tbl_b = open(tbl_path, "rb").read()
+    tbl_d = tfq3_ref.load_tables(tbl_path)
+    N, K = 384, 512
+
+    for bits in (3, 4, 5):
+        wd = rng.integers(0, 2**32, (N // 16) * (K // 128) * bits * 2 * 32, dtype=np.uint64).astype(np.uint32)
+        sc = (0.02 + 0.01 * rng.random((N // 128, K // 128))).astype(np.float16)
+        bias = torch.randn(300, dtype=torch.float32)
+        lin = Tfq3Linear(450, 300, bits, wd, sc, tbl_b, tbl_d, bias=bias)
+        xs = [torch.randn(rows, 450, dtype=torch.bfloat16) for rows in (1, 16, 40)]
+        ys_cpu = [lin(x) for x in xs]
+        lin.to("mps")
+        for x, y_cpu in zip(xs, ys_cpu):
+            y_mps = lin(x.to("mps")).cpu()
+            cos = torch.nn.functional.cosine_similarity(y_cpu.float().flatten(), y_mps.float().flatten(), dim=0).item()
+            assert cos > 0.9999, f"Tfq3Linear MPS {bits}b rows={x.shape[0]} cos={cos}"
+
+    lut0 = tfq4_ref.load_pwv4_tables(os.path.join(REPO_ROOT, "reference", "tables", "pw_v4_e8p_tables.bin"))
+    lut2, _ = tfq4_ref.build_true_e8p_abs_codebook()
+    wd4 = rng.integers(0, 2**32, (N, K // 16), dtype=np.uint64).astype(np.uint32)
+    sc4 = (0.02 + 0.01 * rng.random((N // 128, K // 128))).astype(np.float16)
+    for kind, lut in ((0, lut0), (2, lut2.astype(np.float32))):
+        lin4 = Tfq4Linear(450, 300, wd4, sc4, lut, table_kind=kind)
+        x4 = torch.randn(4, 450, dtype=torch.float16)
+        y_cpu = lin4(x4)
+        y_mps = lin4.to("mps")(x4.to("mps")).cpu()
+        cos = torch.nn.functional.cosine_similarity(y_cpu.float().flatten(), y_mps.float().flatten(), dim=0).item()
+        assert cos > 0.9999, f"Tfq4Linear MPS kind={kind} cos={cos}"
+    print("PASS mps: zero-build fused Metal kernels for Tfq3Linear (3/4/5b sk8+prefill) and Tfq4Linear (kind=0 & kind=2)")
+
+
 if __name__ == "__main__":
     print("datasets importable:", __import__("importlib").util.find_spec("datasets") is not None)
     test_cpu_decode_matches_reference()
     test_tfq4_table_kind_decode()
+    test_mps_fused_kernels()
     test_complete_checkpoint_loads()
     expect("embed", ["model.embed_tokens.weight"])
     expect("tfpw", [f"model.layers.0.mlp.{p}.weight" for p in MLP])
